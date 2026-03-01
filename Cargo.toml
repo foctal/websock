@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "websock",
+    "websock-proto", 
+    "websock-tungstenite", 
+    "websock-wasm", 
+    "websock-wasm-demo",
+    "websock-mux", 
+    "websock-tungstenite-mux", 
+    "websock-wasm-mux", 
+    "websock-mux-proto"
+]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2024"
+authors = ["shellrow <shellrow@foctal.com>"]
+
+[workspace.dependencies]
+websock-proto = { path = "websock-proto" }
+websock-tungstenite = { path = "websock-tungstenite" }
+websock-wasm = { path = "websock-wasm" }
+websock-mux-proto = { path = "websock-mux-proto" }
+websock-tungstenite-mux = { path = "websock-tungstenite-mux" }
+websock-wasm-mux = { path = "websock-wasm-mux" }
+bytes = "1"

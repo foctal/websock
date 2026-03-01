@@ -1,0 +1,17 @@
+[package]
+name = "websock-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Protocol-level primitives shared across websock transports."
+repository = "https://github.com/foctal/websock"
+readme = "../README.md"
+keywords = ["network", "websocket"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = "2"
+futures-core = { version = "0.3" }
+futures-sink = { version = "0.3" }

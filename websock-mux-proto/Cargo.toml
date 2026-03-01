@@ -1,0 +1,26 @@
+[package]
+name = "websock-mux-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Protocol for multiplexing WebSocket logical streams"
+repository = "https://github.com/foctal/websock"
+readme = "../README.md"
+keywords = ["network", "websocket", "multiplex"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = "2"
+websock-proto = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "proto_bench"
+harness = false

@@ -1,0 +1,40 @@
+[package]
+name = "websock-mux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebSocket multiplexing layer for logical streams"
+repository = "https://github.com/foctal/websock"
+readme = "../README.md"
+keywords = ["network", "websocket", "multiplex", "native", "wasm"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+websock-proto = { workspace = true }
+websock-mux-proto = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+websock-tungstenite-mux = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+websock-wasm-mux = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+bytes = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+url = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2"
+
+[[example]]
+name = "echo-client-mux"
+path = "examples/echo-client-mux.rs"
+
+[[example]]
+name = "echo-server-mux"
+path = "examples/echo-server-mux.rs"

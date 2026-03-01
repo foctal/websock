@@ -1,0 +1,21 @@
+[package]
+name = "websock-wasm-mux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebAssembly WebSocket multiplexing transport (WebTransport-like streams over WebSocket)."
+repository = "https://github.com/foctal/websock"
+readme = "../README.md"
+keywords = ["network", "websocket", "multiplex", "wasm"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+websock-proto = { workspace = true }
+websock-mux-proto = { workspace = true }
+websock-wasm = { workspace = true }
+bytes = { workspace = true }
+futures-channel = "0.3"
+futures-io = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+wasm-bindgen-futures = "0.4"

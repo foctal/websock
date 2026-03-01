@@ -1,0 +1,28 @@
+[package]
+name = "websock-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebAssembly transport implementation for browser-based WebSockets."
+repository = "https://github.com/foctal/websock"
+readme = "../README.md"
+keywords = ["network", "websocket", "wasm"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+websock-proto = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "WebSocket",
+  "MessageEvent",
+  "Event",
+  "CloseEvent",
+  "BinaryType",
+]}
+js-sys = "0.3"
+futures-util = { version = "0.3" }
+futures-channel = "0.3"
+futures-core = { version = "0.3" }
+futures-sink = { version = "0.3" }

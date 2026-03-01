@@ -1,0 +1,30 @@
+[package]
+name = "websock-tungstenite"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Native transport implementation based on tokio-tungstenite."
+repository = "https://github.com/foctal/websock"
+readme = "../README.md"
+keywords = ["network", "websocket", "native"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+websock-proto = { workspace = true }
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]} 
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
+rcgen = "0.14"
+rustls-pemfile = "2.2"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3" }
+futures-core = { version = "0.3" }
+futures-sink = { version = "0.3" }
+tokio-util = { version = "0.7" }
+
+[features]
+default = ["ring"]
+ring = ["rustls/ring"]
+aws-lc-rs = ["rustls/aws-lc-rs"]

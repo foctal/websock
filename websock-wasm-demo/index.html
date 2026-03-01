@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>websock-wasm-demo</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial; padding: 16px; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+      input { padding: 8px; min-width: 360px; }
+      button { padding: 8px 12px; }
+      pre { background: #111; color: #ddd; padding: 12px; border-radius: 8px; min-height: 240px; overflow: auto; }
+      small { color: #666; }
+    </style>
+  </head>
+  <body>
+    <h1>websock-wasm-demo</h1>
+
+    <div class="row">
+      <input id="url" value="ws://localhost:9001" />
+    </div>
+
+    <div class="row">
+      <button id="btn-conn">conn demo</button>
+      <button id="btn-split">split demo</button>
+      <button id="btn-mux-bi">mux bi demo</button>
+    </div>
+
+    <small>
+      Tip: For TLS testing use <code>wss://</code> and a certificate that your browser trusts.
+    </small>
+
+    <h3>log</h3>
+    <pre id="log"></pre>
+
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+  </body>
+</html>
