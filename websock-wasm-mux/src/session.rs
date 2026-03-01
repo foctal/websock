@@ -734,8 +734,8 @@ impl SessionInner {
                                     if batch_frames >= inner.limits.max_batch_frames || batch.len() >= max_bytes {
                                         break;
                                     }
-                                    match outbound_rx.try_next() {
-                                        Ok(Some(OutboundCmd::Frame(next_frame))) => {
+                                    match outbound_rx.try_recv() {
+                                        Ok(OutboundCmd::Frame(next_frame)) => {
                                             let next = next_frame.encode().freeze();
                                             if !batch.is_empty() && batch.len() + next.len() > max_bytes {
                                                 break;
@@ -743,7 +743,6 @@ impl SessionInner {
                                             batch.extend_from_slice(&next);
                                             batch_frames += 1;
                                         }
-                                        Ok(None) => break,
                                         Err(_) => break,
                                     }
                                 }
