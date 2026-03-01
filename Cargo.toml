@@ -18,10 +18,10 @@ edition = "2024"
 authors = ["shellrow <shellrow@foctal.com>"]
 
 [workspace.dependencies]
-websock-proto = { path = "websock-proto" }
-websock-tungstenite = { path = "websock-tungstenite" }
-websock-wasm = { path = "websock-wasm" }
-websock-mux-proto = { path = "websock-mux-proto" }
-websock-tungstenite-mux = { path = "websock-tungstenite-mux" }
-websock-wasm-mux = { path = "websock-wasm-mux" }
+websock-proto = { path = "websock-proto", version = "0.4.0" }
+websock-tungstenite = { path = "websock-tungstenite", version = "0.4.0" }
+websock-wasm = { path = "websock-wasm", version = "0.4.0" }
+websock-mux-proto = { path = "websock-mux-proto", version = "0.4.0" }
+websock-tungstenite-mux = { path = "websock-tungstenite-mux", version = "0.4.0" }
+websock-wasm-mux = { path = "websock-wasm-mux", version = "0.4.0" }
 bytes = "1"
