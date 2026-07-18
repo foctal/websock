@@ -2,6 +2,7 @@
 
 pub use websock_tungstenite::stream;
 pub use websock_tungstenite::{
-    Client, ClientBuilder, Connection, DangerousClientBuilder, Server, ServerBuilder,
+    Client, ClientBuilder, Connection, ConnectionInfo, DangerousClientBuilder, Server,
+    ServerBuilder,
 };
 pub use websock_tungstenite::{crypto, tls};

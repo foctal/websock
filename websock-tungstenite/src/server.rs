@@ -1,7 +1,7 @@
 //! Server-side WebSocket acceptor for the Tokio Tungstenite transport.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
@@ -66,6 +66,7 @@ pub struct Server {
 
 impl Server {
     /// Accept an incoming WebSocket connection.
+    #[allow(clippy::result_large_err)]
     pub async fn accept(&self) -> Result<Connection<ServerStream>> {
         let (stream, _addr) = self
             .listener
@@ -86,14 +87,17 @@ impl Server {
             (Box::new(stream), false)
         };
 
-        let info = ConnectionInfo {
+        let mut info = ConnectionInfo {
             peer,
             local,
             is_tls,
+            subprotocol: None,
         };
 
         let headers = Arc::clone(&self.headers);
         let protocols = Arc::clone(&self.protocols);
+        let selected_protocol = Arc::new(Mutex::new(None));
+        let selected_protocol_callback = Arc::clone(&selected_protocol);
 
         let ws = accept_hdr_async_with_config(
             stream,
@@ -106,6 +110,10 @@ impl Server {
                     let value =
                         HeaderValue::from_str(protocol).expect("protocol value validated on bind");
                     resp.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, value);
+                    *selected_protocol_callback
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(protocol.to_owned());
                 }
 
                 Ok(resp)
@@ -115,10 +123,19 @@ impl Server {
         .await
         .map_err(map_tungstenite_err)?;
 
-        Ok(Connection { ws, info })
+        info.subprotocol = selected_protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(Connection {
+            ws,
+            info,
+            close_frame: None,
+        })
     }
 
     /// Accept an incoming WebSocket connection, returning the TLS stream type.
+    #[allow(clippy::result_large_err)]
     pub async fn accept_tls(
         &self,
     ) -> Result<Connection<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
@@ -139,7 +156,7 @@ impl Server {
         let headers = Arc::clone(&self.headers);
         let protocols = Arc::clone(&self.protocols);
 
-        let info = ConnectionInfo {
+        let mut info = ConnectionInfo {
             peer: tls_stream
                 .get_ref()
                 .0
@@ -151,7 +168,10 @@ impl Server {
                 .local_addr()
                 .map_err(|e| Error::Io(e.to_string()))?,
             is_tls: true,
+            subprotocol: None,
         };
+        let selected_protocol = Arc::new(Mutex::new(None));
+        let selected_protocol_callback = Arc::clone(&selected_protocol);
 
         let ws = accept_hdr_async_with_config(
             tls_stream,
@@ -164,6 +184,10 @@ impl Server {
                     let value =
                         HeaderValue::from_str(protocol).expect("protocol value validated on bind");
                     resp.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, value);
+                    *selected_protocol_callback
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(protocol.to_owned());
                 }
 
                 Ok(resp)
@@ -173,7 +197,15 @@ impl Server {
         .await
         .map_err(map_tungstenite_err)?;
 
-        Ok(Connection { ws, info })
+        info.subprotocol = selected_protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(Connection {
+            ws,
+            info,
+            close_frame: None,
+        })
     }
 
     /// Return the local address of the listener.

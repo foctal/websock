@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use websock_proto::Bytes;
-use websock_proto::{ConnectOptions, Error, Message, Result};
+use websock_proto::{CloseFrame, ConnectOptions, Error, Message, Result};
 
 use futures_channel::{mpsc, oneshot};
 use futures_util::StreamExt;
@@ -141,17 +141,26 @@ pub async fn connect(url: &str, opts: ConnectOptions) -> Result<Connection> {
     });
     ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
+    let close_frame = Rc::new(RefCell::new(None));
+    let close_frame_handler = Rc::clone(&close_frame);
     let mut tx_close = tx;
-    let onclose = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |_e: web_sys::CloseEvent| {
+    let onclose = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |e: web_sys::CloseEvent| {
+        *close_frame_handler.borrow_mut() = Some(CloseFrame {
+            code: e.code(),
+            reason: e.reason(),
+        });
         let _ = tx_close.try_send(Err(Error::Closed));
         tx_close.close_channel();
     });
     ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+    let negotiated_subprotocol = ws.protocol();
 
     Ok(Connection {
         ws: Rc::new(ws),
         rx: Some(rx),
         max_write_buffer_size: opts.limits.max_write_buffer_size,
+        negotiated_subprotocol,
+        close_frame,
         _onmessage: Some(onmessage),
         _onerror: Some(onerror),
         _onclose: Some(onclose),
@@ -163,6 +172,8 @@ pub struct Connection {
     pub(crate) ws: Rc<web_sys::WebSocket>,
     pub(crate) rx: Option<mpsc::Receiver<Result<Message>>>,
     pub(crate) max_write_buffer_size: usize,
+    pub(crate) negotiated_subprotocol: String,
+    pub(crate) close_frame: Rc<RefCell<Option<CloseFrame>>>,
 
     pub(crate) _onmessage: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     pub(crate) _onerror: Option<Closure<dyn FnMut(web_sys::Event)>>,
@@ -191,10 +202,39 @@ impl Connection {
         rx.next().await.ok_or(Error::Closed)?
     }
 
-    /// Close the WebSocket connection.
+    /// Close the WebSocket connection and wait for the browser close event.
     pub async fn close(&mut self) -> Result<()> {
-        self.ws.close().map_err(js_err)?;
-        Ok(())
+        if self.ws.ready_state() == web_sys::WebSocket::CLOSED {
+            self.rx = None;
+            return Ok(());
+        }
+        if self.ws.ready_state() != web_sys::WebSocket::CLOSING {
+            self.ws.close().map_err(js_err)?;
+        }
+
+        let result = loop {
+            let next = match self.rx.as_mut() {
+                Some(rx) => rx.next().await,
+                None => return Ok(()),
+            };
+            match next {
+                Some(Ok(_)) => continue,
+                Some(Err(Error::Closed)) | None => break Ok(()),
+                Some(Err(error)) => break Err(error),
+            }
+        };
+        self.rx = None;
+        result
+    }
+
+    /// Return the WebSocket subprotocol selected by the server, if any.
+    pub fn negotiated_subprotocol(&self) -> Option<&str> {
+        (!self.negotiated_subprotocol.is_empty()).then_some(self.negotiated_subprotocol.as_str())
+    }
+
+    /// Return the most recently received close-frame metadata, if any.
+    pub fn close_frame(&self) -> Option<CloseFrame> {
+        self.close_frame.borrow().clone()
     }
 }
 

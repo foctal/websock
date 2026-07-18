@@ -6,9 +6,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{Connector, WebSocketStream, tungstenite};
 use tungstenite::client::IntoClientRequest;
-use websock_proto::{ConnectOptions, Error, Message, Result};
+use websock_proto::{CloseFrame, ConnectOptions, Error, Message, Result};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     /// Remote peer address for the connection.
     pub peer: std::net::SocketAddr,
@@ -16,6 +16,8 @@ pub struct ConnectionInfo {
     pub local: std::net::SocketAddr,
     /// True when the connection is established over TLS.
     pub is_tls: bool,
+    /// WebSocket subprotocol selected during the opening handshake.
+    pub subprotocol: Option<String>,
 }
 
 /// Establish a WebSocket connection using Tokio Tungstenite.
@@ -62,7 +64,7 @@ pub async fn connect_with_tls(
     }
 
     let connector = tls.map(Connector::Rustls);
-    let (ws, _resp) =
+    let (ws, resp) =
         tokio_tungstenite::connect_async_tls_with_config(req, Some(config), false, connector)
             .await
             .map_err(map_tungstenite_err)?;
@@ -79,15 +81,25 @@ pub async fn connect_with_tls(
             .local_addr()
             .map_err(|e| Error::Io(e.to_string()))?,
         is_tls: matches!(ws.get_ref(), tokio_tungstenite::MaybeTlsStream::Rustls(_)),
+        subprotocol: resp
+            .headers()
+            .get(tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
     };
 
-    Ok(Connection { ws, info })
+    Ok(Connection {
+        ws,
+        info,
+        close_frame: None,
+    })
 }
 
 /// WebSocket connection wrapper around a Tokio Tungstenite stream.
 pub struct Connection<S = tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     pub(crate) ws: WebSocketStream<S>,
     pub(crate) info: ConnectionInfo,
+    pub(crate) close_frame: Option<CloseFrame>,
 }
 
 impl<S> Connection<S>
@@ -126,7 +138,11 @@ where
                 tungstenite::Message::Pong(_) => continue,
                 tungstenite::Message::Text(s) => return Ok(Message::Text(s.to_string())),
                 tungstenite::Message::Binary(b) => return Ok(Message::Binary(b)),
-                tungstenite::Message::Close(_) => {
+                tungstenite::Message::Close(frame) => {
+                    self.close_frame = frame.map(|frame| CloseFrame {
+                        code: frame.code.into(),
+                        reason: frame.reason.to_string(),
+                    });
                     let _ = self.ws.close(None).await;
                     return Err(Error::Closed);
                 }
@@ -184,7 +200,17 @@ impl<S> Connection<S> {
     }
     /// Return the full connection metadata snapshot.
     pub fn info(&self) -> ConnectionInfo {
-        self.info
+        self.info.clone()
+    }
+
+    /// Return the negotiated WebSocket subprotocol, if any.
+    pub fn negotiated_subprotocol(&self) -> Option<&str> {
+        self.info.subprotocol.as_deref()
+    }
+
+    /// Return the most recently received close-frame metadata, if any.
+    pub fn close_frame(&self) -> Option<CloseFrame> {
+        self.close_frame.clone()
     }
 }
 
