@@ -137,6 +137,7 @@ impl fmt::Display for VarInt {
 }
 
 impl VarInt {
+    /// Decode one QUIC variable-length integer from a byte buffer.
     pub fn decode<B: Buf>(r: &mut B) -> Result<Self, VarIntUnexpectedEnd> {
         if !r.has_remaining() {
             return Err(VarIntUnexpectedEnd);
@@ -179,7 +180,7 @@ impl VarInt {
         Ok(Self(x))
     }
 
-    // Read a varint from an async stream.
+    /// Read one QUIC variable-length integer from an asynchronous stream.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, VarIntUnexpectedEnd> {
         // Eight bytes is the maximum encoded length.
@@ -205,6 +206,7 @@ impl VarInt {
         Ok(v)
     }
 
+    /// Encode this value into a byte buffer.
     pub fn encode<B: BufMut>(&self, w: &mut B) {
         let x = self.0;
         if x <= Self::MAX_1BYTE {
@@ -221,6 +223,7 @@ impl VarInt {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    /// Write this value to an asynchronous stream.
     pub async fn write<S: AsyncWrite + Unpin>(
         &self,
         stream: &mut S,
@@ -246,6 +249,7 @@ impl VarInt {
 #[error("value too large for varint encoding")]
 pub struct VarIntBoundsExceeded;
 
+/// Error returned when a buffer or stream ends before a varint is complete.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
 #[error("unexpected end of buffer")]
 pub struct VarIntUnexpectedEnd;

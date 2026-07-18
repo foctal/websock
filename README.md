@@ -8,6 +8,8 @@
 
 A minimal WebSocket library for native and WebAssembly.
 
+The minimum supported Rust version (MSRV) is 1.88.
+
 ## Workspace crates
 
 - `websock`: top-level facade that selects native (`websock-tungstenite`) or browser (`websock-wasm`) transport.
@@ -58,6 +60,9 @@ let client = ClientBuilder::new()
 The mux transports additionally expose `Limits` for stream counts, queue
 capacities, batching, and per-stream flow-control windows. Invalid or
 inconsistent limits return a protocol error rather than panicking.
+
+The multiplexing wire format, stream lifecycle, flow control, compatibility
+policy, and error codes are specified in [docs/mux-protocol.md](docs/mux-protocol.md).
 
 ## Benchmarking
 

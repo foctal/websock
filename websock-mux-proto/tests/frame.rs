@@ -128,3 +128,16 @@ fn frame_decode_invalid_utf8_reason() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn frame_decode_rejects_non_boolean_fin() {
+    let id = StreamId::new(0, false, StreamDir::Bi).unwrap();
+    let mut buf = BytesMut::new();
+    VarInt::from_u32(2).encode(&mut buf);
+    VarInt::from_u64(id.0).unwrap().encode(&mut buf);
+    VarInt::from_u32(2).encode(&mut buf);
+    VarInt::from_u32(0).encode(&mut buf);
+
+    let error = Frame::decode(&mut Cursor::new(buf.freeze())).unwrap_err();
+    assert!(matches!(error, FrameDecodeError::InvalidFin(2)));
+}

@@ -2,16 +2,21 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::varint::{VarInt, VarIntBoundsExceeded, VarIntUnexpectedEnd};
 
+/// Directionality of a multiplexed stream.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum StreamDir {
+    /// Bidirectional stream.
     Bi,
+    /// Unidirectional stream.
     Uni,
 }
 
+/// Encoded stream identifier containing counter, initiator, and direction bits.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct StreamId(pub u64);
 
 impl StreamId {
+    /// Construct a stream identifier from its component fields.
     pub fn new(
         counter: u64,
         is_server: bool,
@@ -29,6 +34,7 @@ impl StreamId {
         Ok(Self(value))
     }
 
+    /// Return the stream direction encoded in the identifier.
     pub fn dir(self) -> StreamDir {
         if (self.0 >> 1) & 1 == 1 {
             StreamDir::Uni
@@ -37,6 +43,7 @@ impl StreamId {
         }
     }
 
+    /// Return whether the server initiated the stream.
     pub fn initiator_is_server(self) -> bool {
         self.0 & 1 == 1
     }
@@ -47,33 +54,54 @@ impl StreamId {
     }
 }
 
+/// A single frame in the version 1 mux wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// Open a peer-receive-only stream.
     OpenUni {
+        /// Identifier of the new stream.
         id: StreamId,
     },
+    /// Open a bidirectional stream.
     OpenBi {
+        /// Identifier of the new stream.
         id: StreamId,
     },
+    /// Carry stream payload data and optional end-of-stream state.
     Stream {
+        /// Target stream identifier.
         id: StreamId,
+        /// Payload bytes.
         data: Bytes,
+        /// Whether this frame finishes the sender direction.
         fin: bool,
     },
+    /// Abruptly terminate the sender direction.
     ResetStream {
+        /// Target stream identifier.
         id: StreamId,
+        /// Application-defined reset code.
         code: u64,
     },
+    /// Ask the peer to stop its sender direction.
     StopSending {
+        /// Target stream identifier.
         id: StreamId,
+        /// Application-defined stop code.
         code: u64,
     },
+    /// Increase the cumulative stream-data allowance.
     MaxStreamData {
+        /// Target stream identifier.
         id: StreamId,
+        /// New cumulative byte limit.
         max: u64,
     },
+    /// Close the entire mux connection.
     ConnectionClose {
+        /// Connection-level error code.
         code: u64,
+        /// Human-readable UTF-8 reason.
         reason: String,
     },
 }
@@ -101,6 +129,7 @@ impl Frame {
         }
     }
 
+    /// Encode this frame into its canonical wire representation.
     pub fn encode(&self) -> BytesMut {
         let mut buf = BytesMut::with_capacity(self.encoded_len());
         match self {
@@ -144,6 +173,7 @@ impl Frame {
         buf
     }
 
+    /// Decode one complete frame from the front of a byte buffer.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, FrameDecodeError> {
         let tag = VarInt::decode(buf)?.into_inner();
         match tag {
@@ -155,7 +185,11 @@ impl Frame {
             }),
             2 => {
                 let id = StreamId(VarInt::decode(buf)?.into_inner());
-                let fin = VarInt::decode(buf)?.into_inner() != 0;
+                let fin = match VarInt::decode(buf)?.into_inner() {
+                    0 => false,
+                    1 => true,
+                    value => return Err(FrameDecodeError::InvalidFin(value)),
+                };
                 let len = VarInt::decode(buf)?.into_inner() as usize;
                 if buf.remaining() < len {
                     return Err(FrameDecodeError::UnexpectedEnd);
@@ -192,14 +226,21 @@ impl Frame {
     }
 }
 
+/// Errors produced while decoding a mux frame.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameDecodeError {
+    /// The buffer ended before the frame was complete.
     #[error("unexpected end of buffer")]
     UnexpectedEnd,
+    /// The frame tag is not defined by this protocol version.
     #[error("unknown frame tag {0}")]
     UnknownTag(u64),
+    /// A connection-close reason was not valid UTF-8.
     #[error("invalid utf-8 in reason")]
     InvalidUtf8,
+    /// A stream FIN field contained a value other than zero or one.
+    #[error("invalid stream FIN value {0}")]
+    InvalidFin(u64),
 }
 
 impl From<VarIntUnexpectedEnd> for FrameDecodeError {

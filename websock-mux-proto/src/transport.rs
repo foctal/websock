@@ -32,7 +32,9 @@ pub trait MuxRecvStream {
 
 /// Cross-platform mux session contract.
 pub trait MuxSession {
+    /// Concrete send-stream type.
     type SendStream: MuxSendStream;
+    /// Concrete receive-stream type.
     type RecvStream: MuxRecvStream;
 
     /// Open a unidirectional stream.
@@ -46,4 +48,10 @@ pub trait MuxSession {
 
     /// Accept a peer-initiated bidirectional stream.
     fn accept_bi<'a>(&'a self) -> LocalBoxFuture<'a, Result<(Self::SendStream, Self::RecvStream)>>;
+
+    /// Close the underlying WebSocket and wait for session tasks to finish.
+    fn shutdown<'a>(&'a self) -> LocalBoxFuture<'a, Result<()>>;
+
+    /// Return true if the session has closed.
+    fn closed(&self) -> bool;
 }

@@ -30,9 +30,11 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// A multiplexing frame could not be decoded.
     #[error("frame decode error: {0}")]
     FrameDecode(String),
 
+    /// A multiplexing stream identifier was invalid.
     #[error("stream id error: {0}")]
     StreamId(String),
 

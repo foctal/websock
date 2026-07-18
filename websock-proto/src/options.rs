@@ -78,6 +78,7 @@ pub struct ServerOptions {
     pub limits: WebSocketLimits,
 }
 
+/// Return the ALPN identifiers supported by the WebSocket transport.
 pub fn default_ws_alpn() -> Vec<Vec<u8>> {
     vec![ALPN_HTTP_1_1.to_vec()]
 }
