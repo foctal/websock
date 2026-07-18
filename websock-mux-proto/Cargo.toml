@@ -2,6 +2,7 @@
 name = "websock-mux-proto"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Protocol for multiplexing WebSocket logical streams"
 repository = "https://github.com/foctal/websock"

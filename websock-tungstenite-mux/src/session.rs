@@ -3,7 +3,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
 
@@ -12,9 +12,9 @@ use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_tungstenite::tungstenite;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 use websock_proto::{Error, Result};
 
 use websock_mux_proto::VarInt;
@@ -131,7 +131,6 @@ impl Limits {
     }
 }
 
-#[derive(Clone)]
 pub struct Session {
     inner: Arc<SessionInner>,
     accept_uni: Arc<Mutex<mpsc::Receiver<RecvStream>>>,
@@ -205,6 +204,35 @@ impl Session {
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream)> {
         let mut rx = self.accept_bi.lock().await;
         rx.recv().await.ok_or(Error::Closed)
+    }
+
+    /// Gracefully close the WebSocket and wait for all session tasks to finish.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.inner.shutdown().await
+    }
+
+    /// Return whether the session has finished shutting down.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        self.inner.session_handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: self.inner.clone(),
+            accept_uni: self.accept_uni.clone(),
+            accept_bi: self.accept_bi.clone(),
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.inner.session_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.request_shutdown();
+        }
     }
 }
 
@@ -830,6 +858,7 @@ pub(crate) enum OutboundCmd {
     Frame(Frame),
     Ws(tungstenite::Message),
     Flush { ack: oneshot::Sender<Result<()>> },
+    Shutdown { ack: oneshot::Sender<Result<()>> },
 }
 
 pub(crate) struct SessionInner {
@@ -845,6 +874,11 @@ pub(crate) struct SessionInner {
     next_peer_uni: AtomicU64,
     next_peer_bi: AtomicU64,
     closed: AtomicBool,
+    shutdown_started: AtomicBool,
+    session_handles: AtomicUsize,
+    active_tasks: AtomicUsize,
+    tasks_done: Notify,
+    cancel: CancellationToken,
 }
 
 impl SessionInner {
@@ -868,6 +902,11 @@ impl SessionInner {
             next_peer_uni: AtomicU64::new(0),
             next_peer_bi: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            session_handles: AtomicUsize::new(1),
+            active_tasks: AtomicUsize::new(2),
+            tasks_done: Notify::new(),
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -882,7 +921,14 @@ impl SessionInner {
 
         let inbound = self.clone();
         tokio::spawn(async move {
-            while let Some(msg) = ws_stream.next().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = inbound.cancel.cancelled() => break,
+                    msg = ws_stream.next() => msg,
+                };
+                let Some(msg) = msg else {
+                    break;
+                };
                 let msg = match msg {
                     Ok(m) => m,
                     Err(_) => break,
@@ -924,7 +970,7 @@ impl SessionInner {
                 }
             }
 
-            inbound.close_all().await;
+            inbound.task_finished().await;
         });
 
         let outbound = self.clone();
@@ -949,7 +995,20 @@ impl SessionInner {
             let mut batch = BytesMut::new();
             let mut batch_frames = 0usize;
 
-            while let Some(cmd) = outbound_rx.recv().await {
+            loop {
+                let cmd = tokio::select! {
+                    _ = outbound.cancel.cancelled() => {
+                        let _ = flush_batch(&mut ws_sink, &mut batch).await;
+                        let _ = ws_sink.close().await;
+                        break;
+                    }
+                    cmd = outbound_rx.recv() => cmd,
+                };
+                let Some(cmd) = cmd else {
+                    let _ = flush_batch(&mut ws_sink, &mut batch).await;
+                    let _ = ws_sink.close().await;
+                    break;
+                };
                 match cmd {
                     OutboundCmd::Frame(frame) => {
                         let encoded = frame.encode().freeze();
@@ -996,10 +1055,70 @@ impl SessionInner {
                         let flush_res = ws_sink.flush().await.map_err(map_tungstenite_err);
                         let _ = ack.send(flush_res);
                     }
+                    OutboundCmd::Shutdown { ack } => {
+                        let result = if let Err(err) = flush_batch(&mut ws_sink, &mut batch).await {
+                            Err(map_tungstenite_err(err))
+                        } else {
+                            ws_sink.close().await.map_err(map_tungstenite_err)
+                        };
+                        let _ = ack.send(result);
+                        break;
+                    }
                 }
             }
-            outbound.close_all().await;
+            outbound.task_finished().await;
         });
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_started.store(true, Ordering::Release);
+        self.cancel.cancel();
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            self.wait_for_tasks().await;
+            return Ok(());
+        }
+
+        let first = !self.shutdown_started.swap(true, Ordering::AcqRel);
+        let result = if first {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            match self
+                .outbound_tx
+                .send(OutboundCmd::Shutdown { ack: ack_tx })
+                .await
+            {
+                Ok(()) => ack_rx.await.unwrap_or(Err(Error::Closed)),
+                Err(_) => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+
+        if first {
+            self.cancel.cancel();
+        }
+        self.wait_for_tasks().await;
+        result
+    }
+
+    async fn task_finished(&self) {
+        self.close_all().await;
+        self.cancel.cancel();
+        if self.active_tasks.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tasks_done.notify_waiters();
+        }
+    }
+
+    async fn wait_for_tasks(&self) {
+        loop {
+            let notified = self.tasks_done.notified();
+            if self.active_tasks.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) async fn handle_frame(self: &Arc<Self>, frame: Frame) -> Result<()> {
@@ -1445,6 +1564,14 @@ impl websock_mux_proto::MuxSession for Session {
         )>,
     > {
         Box::pin(async move { Session::accept_bi(self).await })
+    }
+
+    fn shutdown<'a>(&'a self) -> websock_proto::LocalBoxFuture<'a, Result<()>> {
+        Box::pin(async move { Session::shutdown(self).await })
+    }
+
+    fn closed(&self) -> bool {
+        Session::is_closed(self)
     }
 }
 

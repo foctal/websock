@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures_channel::mpsc;
+use futures_channel::{mpsc, oneshot};
 use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use futures_util::lock::Mutex;
 use futures_util::stream::Stream;
@@ -118,7 +118,6 @@ impl Limits {
     }
 }
 
-#[derive(Clone)]
 pub struct Session {
     inner: Rc<SessionInner>,
     accept_uni: Rc<Mutex<mpsc::Receiver<RecvStream>>>,
@@ -189,6 +188,40 @@ impl Session {
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream)> {
         let mut rx = self.accept_bi.lock().await;
         rx.next().await.ok_or(Error::Closed)
+    }
+
+    /// Close the WebSocket and wait for the session task to finish.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.inner.request_shutdown();
+        self.inner.wait_closed().await
+    }
+
+    /// Return whether the session has finished shutting down.
+    pub fn is_closed(&self) -> bool {
+        self.inner.task_finished.load(Ordering::Acquire)
+    }
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        self.inner
+            .session_handles
+            .set(self.inner.session_handles.get() + 1);
+        Self {
+            inner: self.inner.clone(),
+            accept_uni: self.accept_uni.clone(),
+            accept_bi: self.accept_bi.clone(),
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let remaining = self.inner.session_handles.get() - 1;
+        self.inner.session_handles.set(remaining);
+        if remaining == 0 {
+            self.inner.request_shutdown();
+        }
     }
 }
 
@@ -810,6 +843,10 @@ struct SessionInner {
     next_peer_uni: AtomicU64,
     next_peer_bi: AtomicU64,
     closed: AtomicBool,
+    shutdown_started: AtomicBool,
+    session_handles: Cell<usize>,
+    close_waiters: RefCell<Vec<oneshot::Sender<()>>>,
+    task_finished: AtomicBool,
 }
 
 impl SessionInner {
@@ -831,7 +868,26 @@ impl SessionInner {
             next_peer_uni: AtomicU64::new(0),
             next_peer_bi: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            session_handles: Cell::new(1),
+            close_waiters: RefCell::new(Vec::new()),
+            task_finished: AtomicBool::new(false),
         }
+    }
+
+    fn request_shutdown(&self) {
+        if !self.shutdown_started.swap(true, Ordering::AcqRel) {
+            self.outbound_tx.borrow_mut().close_channel();
+        }
+    }
+
+    async fn wait_closed(&self) -> Result<()> {
+        if self.task_finished.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.close_waiters.borrow_mut().push(tx);
+        rx.await.map_err(|_| Error::Closed)
     }
 
     fn spawn_task(
@@ -917,8 +973,9 @@ impl SessionInner {
                 }
             }
 
-            inner.close_all().await;
             let _ = conn.close().await;
+            inner.close_all().await;
+            inner.finish_task();
         });
     }
 
@@ -1206,6 +1263,13 @@ impl SessionInner {
         *self.accept_bi_tx.lock().await = None;
     }
 
+    fn finish_task(&self) {
+        self.task_finished.store(true, Ordering::Release);
+        for waiter in self.close_waiters.borrow_mut().drain(..) {
+            let _ = waiter.send(());
+        }
+    }
+
     fn validate_peer_stream_id(&self, id: StreamId) -> bool {
         let next = match id.dir() {
             StreamDir::Uni => &self.next_peer_uni,
@@ -1308,6 +1372,14 @@ impl websock_mux_proto::MuxSession for Session {
         )>,
     > {
         Box::pin(async move { Session::accept_bi(self).await })
+    }
+
+    fn shutdown<'a>(&'a self) -> websock_proto::LocalBoxFuture<'a, Result<()>> {
+        Box::pin(async move { Session::shutdown(self).await })
+    }
+
+    fn closed(&self) -> bool {
+        Session::is_closed(self)
     }
 }
 
