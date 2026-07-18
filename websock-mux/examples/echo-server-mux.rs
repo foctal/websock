@@ -3,7 +3,8 @@
 //! This server accepts mux sessions and echoes bytes over each bidirectional stream.
 
 use clap::Parser;
-use std::{fs, io, path};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::path;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use websock_mux::{Server, ServerBuilder};
@@ -91,20 +92,11 @@ async fn main() -> anyhow::Result<()> {
 fn load_pem_cert_and_key(
     cert_path: &path::Path,
     key_path: &path::Path,
-) -> anyhow::Result<(
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
-    let chain_file = fs::File::open(cert_path)?;
-    let mut chain_reader = io::BufReader::new(chain_file);
-    let chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut chain_reader).collect::<Result<_, _>>()?;
+) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let chain = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
     anyhow::ensure!(!chain.is_empty(), "could not find certificate");
 
-    let key_file = fs::File::open(key_path)?;
-    let mut key_reader = io::BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or_else(|| anyhow::anyhow!("missing private key"))?;
+    let key = PrivateKeyDer::from_pem_file(key_path)?;
 
     Ok((chain, key))
 }
