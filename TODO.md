@@ -45,9 +45,9 @@ items remain release blockers or follow-up work.
 - [x] Add native end-to-end tests for connect/subprotocol negotiation,
   text/binary round trips, graceful close, oversized-message rejection, mux uni
   streams, differing flow-control windows, and invalid-limit rejection.
-- [ ] Extend native end-to-end tests with split operation, mux bidirectional
+- [x] Extend native end-to-end tests with split operation, mux bidirectional
   streams, malformed wire frames, reset/stop propagation, and TLS round trips.
-- [ ] Add browser tests under `wasm-bindgen-test` for connect failure, queue
+- [x] Add browser tests under `wasm-bindgen-test` for connect failure, queue
   overflow, close, split ownership, and mux parity.
 - [x] Ensure WebSocket-level frame/message limits are applied in Tungstenite
   configuration before a complete oversized message is buffered.
@@ -55,7 +55,7 @@ items remain release blockers or follow-up work.
   browser receive queue, message-size, and `bufferedAmount` bounds.
 - [x] Advertise only HTTP/1.1 in the default ALPN list because the current
   Tungstenite transport does not implement WebSocket over HTTP/2.
-- [ ] Add explicit connection/session shutdown APIs with completion semantics
+- [x] Add explicit connection/session shutdown APIs with completion semantics
   and task cancellation. Dropping the last mux session handle should not leave
   detached tasks and a socket alive indefinitely.
 
@@ -63,19 +63,20 @@ items remain release blockers or follow-up work.
 
 - [ ] Preserve structured error sources and I/O error kinds instead of reducing
   all transport errors to strings. This is a semver-sensitive public API change.
-- [ ] Expose negotiated subprotocol and close-frame details consistently on
+- [x] Expose negotiated subprotocol and close-frame details consistently on
   native and browser connections.
-- [ ] Define and document the mux wire protocol, compatibility policy, error
+- [x] Define and document the mux wire protocol, compatibility policy, error
   codes, stream state machine, and flow-control rules.
-- [ ] Expand crate-level and public-item documentation and enable
+- [x] Expand crate-level and public-item documentation and enable
   `#![warn(missing_docs)]` incrementally.
 - [x] Add baseline CI for formatting, Clippy with warnings denied, tests,
   documentation, Linux/macOS/Windows, and `wasm32-unknown-unknown`.
-- [ ] Extend CI with an explicit MSRV job, minimal feature-set builds, dependency
+- [x] Extend CI with an explicit MSRV job, minimal feature-set builds, dependency
   policy checks, and security audits.
-- [ ] Declare and test the MSRV, add changelog/release guidance, and verify
-  package contents with `cargo package --list` for every published crate.
-- [ ] Review dependency features and duplicate native/mux TLS implementations to
+- [x] Declare and test the MSRV, and add changelog and release guidance.
+- [ ] Manually verify package contents with `cargo package --list` for every
+  published crate as part of the release process.
+- [x] Review dependency features and duplicate native/mux TLS implementations to
   reduce compile time, binary size, and maintenance drift.
-- [ ] Add fuzz targets for varint/frame decoding and stateful mux frame
+- [x] Add fuzz targets for varint/frame decoding and stateful mux frame
   sequences, plus long-running concurrency and backpressure tests.
