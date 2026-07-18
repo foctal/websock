@@ -29,6 +29,14 @@ pub async fn connect_with_tls(
     opts: ConnectOptions,
     tls: Option<Arc<ClientConfig>>,
 ) -> Result<Connection> {
+    opts.limits.validate()?;
+    let write_buffer_size = (128 * 1024).min(opts.limits.max_write_buffer_size.saturating_sub(1));
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size((128 * 1024).min(opts.limits.max_frame_size))
+        .write_buffer_size(write_buffer_size)
+        .max_write_buffer_size(opts.limits.max_write_buffer_size)
+        .max_message_size(Some(opts.limits.max_message_size))
+        .max_frame_size(Some(opts.limits.max_frame_size));
     let mut req = url
         .into_client_request()
         .map_err(|e| Error::InvalidUrl(e.to_string()))?;
@@ -54,9 +62,10 @@ pub async fn connect_with_tls(
     }
 
     let connector = tls.map(Connector::Rustls);
-    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector)
-        .await
-        .map_err(map_tungstenite_err)?;
+    let (ws, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(req, Some(config), false, connector)
+            .await
+            .map_err(map_tungstenite_err)?;
 
     let info = ConnectionInfo {
         peer: ws

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::{accept_hdr_async_with_config, tungstenite};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::header::{HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use websock_proto::{Error, Result, ServerOptions};
@@ -22,6 +22,7 @@ pub async fn bind<A>(
 where
     A: ToSocketAddrs,
 {
+    opts.limits.validate()?;
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| Error::Io(e.to_string()))?;
@@ -29,12 +30,20 @@ where
     validate_protocols(&opts)?;
 
     let acceptor = tls.map(|cfg| TlsAcceptor::from(Arc::new(cfg)));
+    let write_buffer_size = (128 * 1024).min(opts.limits.max_write_buffer_size.saturating_sub(1));
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size((128 * 1024).min(opts.limits.max_frame_size))
+        .write_buffer_size(write_buffer_size)
+        .max_write_buffer_size(opts.limits.max_write_buffer_size)
+        .max_message_size(Some(opts.limits.max_message_size))
+        .max_frame_size(Some(opts.limits.max_frame_size));
 
     Ok(Server {
         listener,
         protocols: Arc::new(opts.protocols.into_iter().collect()),
         headers: Arc::new(headers),
         acceptor,
+        config,
     })
 }
 
@@ -52,6 +61,7 @@ pub struct Server {
     protocols: Arc<HashSet<String>>,
     headers: Arc<Vec<(HeaderName, HeaderValue)>>,
     acceptor: Option<TlsAcceptor>,
+    config: tungstenite::protocol::WebSocketConfig,
 }
 
 impl Server {
@@ -85,7 +95,7 @@ impl Server {
         let headers = Arc::clone(&self.headers);
         let protocols = Arc::clone(&self.protocols);
 
-        let ws = tokio_tungstenite::accept_hdr_async(
+        let ws = accept_hdr_async_with_config(
             stream,
             move |req: &Request, mut resp: Response| {
                 for (name, value) in headers.iter() {
@@ -100,6 +110,7 @@ impl Server {
 
                 Ok(resp)
             },
+            Some(self.config),
         )
         .await
         .map_err(map_tungstenite_err)?;
@@ -142,7 +153,7 @@ impl Server {
             is_tls: true,
         };
 
-        let ws = tokio_tungstenite::accept_hdr_async(
+        let ws = accept_hdr_async_with_config(
             tls_stream,
             move |req: &Request, mut resp: Response| {
                 for (name, value) in headers.iter() {
@@ -157,6 +168,7 @@ impl Server {
 
                 Ok(resp)
             },
+            Some(self.config),
         )
         .await
         .map_err(map_tungstenite_err)?;
@@ -201,10 +213,8 @@ fn select_protocol<'a>(req: &'a Request, allowed: &HashSet<String>) -> Option<&'
     }
     let header = req.headers().get(SEC_WEBSOCKET_PROTOCOL)?;
     let header = header.to_str().ok()?;
-    for candidate in header.split(',').map(|s| s.trim()) {
-        if allowed.contains(candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    header
+        .split(',')
+        .map(str::trim)
+        .find(|candidate| allowed.contains(*candidate))
 }

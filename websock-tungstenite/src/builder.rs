@@ -6,7 +6,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use websock_proto::default_ws_alpn;
-use websock_proto::{ConnectOptions, Error, Result, ServerOptions};
+use websock_proto::{ConnectOptions, Error, Result, ServerOptions, WebSocketLimits};
 
 /// Builder for creating a WebSocket client.
 ///
@@ -61,6 +61,12 @@ impl ClientBuilder {
         for (k, v) in headers {
             self.opts.headers.push((k.into(), v.into()));
         }
+        self
+    }
+
+    /// Configure WebSocket message, frame, and write-buffer limits.
+    pub fn with_limits(mut self, limits: WebSocketLimits) -> Self {
+        self.opts.limits = limits;
         self
     }
 
@@ -235,6 +241,12 @@ impl ServerBuilder {
     /// Add a response header to the server handshake.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.opts.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Configure accepted WebSocket message, frame, and write-buffer limits.
+    pub fn with_limits(mut self, limits: WebSocketLimits) -> Self {
+        self.opts.limits = limits;
         self
     }
 

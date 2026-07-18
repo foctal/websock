@@ -1,6 +1,6 @@
 //! Builders for browser WebSocket clients.
 
-use websock_proto::{ConnectOptions, Error, Result};
+use websock_proto::{ConnectOptions, Error, Result, WebSocketLimits};
 
 use crate::Connection;
 use crate::connection::connect;
@@ -54,6 +54,12 @@ impl ClientBuilder {
         for (k, v) in headers {
             self.opts.headers.push((k.into(), v.into()));
         }
+        self
+    }
+
+    /// Configure WebSocket message resource limits.
+    pub fn with_limits(mut self, limits: WebSocketLimits) -> Self {
+        self.opts.limits = limits;
         self
     }
 
