@@ -1,7 +1,7 @@
 //! Certificate handling utilities.
 
 use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject};
 use std::{fs, path::Path, sync::Arc};
 use websock_proto::{Error, Result};
 
@@ -26,8 +26,8 @@ pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         return Ok(vec![CertificateDer::from(cert_bytes)]);
     }
 
-    rustls_pemfile::certs(&mut &*cert_bytes)
-        .collect::<std::result::Result<Vec<_>, std::io::Error>>()
+    CertificateDer::pem_slice_iter(&cert_bytes)
+        .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Io(e.to_string()))
 }
 

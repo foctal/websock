@@ -44,6 +44,63 @@ jobs:
           -p websock-wasm-mux
           -p websock-wasm-demo
           --target wasm32-unknown-unknown
+      - name: Install wasm-bindgen test runner
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Build browser test server
+        run: cargo build -p websock-browser-test-server
+      - name: Run browser integration tests
+        shell: bash
+        run: |
+          target/debug/websock-browser-test-server &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          ready=false
+          for attempt in {1..30}; do
+            if (echo > /dev/tcp/127.0.0.1/32123) 2>/dev/null &&
+               (echo > /dev/tcp/127.0.0.1/32124) 2>/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            echo "browser test server failed to start" >&2
+            exit 1
+          fi
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+            cargo test -p websock-wasm -p websock-wasm-mux \
+            --tests --target wasm32-unknown-unknown
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo check --workspace --all-targets
+
+  minimal-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo check --workspace --all-targets --no-default-features
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
 
   platforms:
     strategy:

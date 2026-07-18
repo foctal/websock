@@ -1,6 +1,6 @@
 //! Private key handling utilities.
 
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use std::{fs, path::Path};
 use websock_proto::{Error, Result};
 
@@ -13,9 +13,7 @@ pub fn load_key(key_path: &Path) -> Result<PrivateKeyDer<'static>> {
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key))
     } else {
         // Decode PEM.
-        rustls_pemfile::private_key(&mut &*key)
-            .map_err(|e| Error::Tls(e.to_string()))?
-            .ok_or_else(|| Error::Io("no keys found".into()))?
+        PrivateKeyDer::from_pem_slice(&key).map_err(|e| Error::Tls(e.to_string()))?
     };
 
     Ok(key)

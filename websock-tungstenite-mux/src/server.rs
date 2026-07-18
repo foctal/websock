@@ -103,6 +103,7 @@ pub struct Server {
 }
 
 impl Server {
+    #[allow(clippy::result_large_err)]
     pub async fn accept(&self) -> Result<Session> {
         let (stream, _) = self
             .listener
