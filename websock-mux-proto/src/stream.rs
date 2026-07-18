@@ -22,7 +22,7 @@ impl StreamId {
             StreamDir::Bi => 0,
             StreamDir::Uni => 1,
         };
-        let value = counter.checked_shl(2).ok_or(VarIntBoundsExceeded)?
+        let value = counter.checked_mul(4).ok_or(VarIntBoundsExceeded)?
             | ((dir_bit as u64) << 1)
             | (initiator as u64);
         VarInt::from_u64(value)?;
@@ -39,6 +39,11 @@ impl StreamId {
 
     pub fn initiator_is_server(self) -> bool {
         self.0 & 1 == 1
+    }
+
+    /// Return the stream sequence number encoded in this ID.
+    pub fn counter(self) -> u64 {
+        self.0 >> 2
     }
 }
 

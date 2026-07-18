@@ -64,6 +64,7 @@ impl Client {
         url: &str,
         tls: Option<Arc<ClientConfig>>,
     ) -> Result<Session> {
+        self.limits.validate()?;
         validate_client_protocols(&self.opts)?;
 
         let mut request = url
@@ -88,10 +89,15 @@ impl Client {
         }
 
         let connector = tls.map(Connector::Rustls);
-        let (stream, response) =
-            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
-                .await
-                .map_err(map_tungstenite_err)?;
+        let config = self.limits.websocket_config();
+        let (stream, response) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            Some(config),
+            false,
+            connector,
+        )
+        .await
+        .map_err(map_tungstenite_err)?;
 
         let proto = negotiated_protocol(&response)
             .ok_or_else(|| Error::Protocol("missing SEC_WEBSOCKET_PROTOCOL in response".into()))?;

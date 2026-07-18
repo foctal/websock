@@ -15,7 +15,7 @@ websock-proto = { workspace = true }
 websock-mux-proto = { workspace = true }
 websock-wasm = { workspace = true }
 bytes = { workspace = true }
-futures-channel = "0.3"
+futures-channel = { version = "0.3", features = ["sink"] }
 futures-io = "0.3"
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 wasm-bindgen-futures = "0.4"

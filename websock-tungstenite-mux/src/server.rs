@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::handshake::server;
 use tungstenite::http;
@@ -69,6 +69,7 @@ pub async fn bind<A>(
 where
     A: ToSocketAddrs,
 {
+    limits.validate()?;
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| Error::Io(e.to_string()))?;
@@ -122,7 +123,7 @@ impl Server {
         let headers = Arc::clone(&self.headers);
         let allowed = Arc::clone(&self.allowed);
 
-        let ws = accept_hdr_async(
+        let ws = accept_hdr_async_with_config(
             stream,
             move |req: &server::Request, mut resp: server::Response| {
                 // Additional headers from configuration
@@ -153,6 +154,7 @@ impl Server {
 
                 Ok(resp)
             },
+            Some(self.limits.websocket_config()),
         )
         .await
         .map_err(map_tungstenite_err)?;

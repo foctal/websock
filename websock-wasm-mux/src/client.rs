@@ -18,7 +18,8 @@ impl Client {
 
     /// Establish a browser WebSocket connection and create a mux [`Session`].
     pub async fn connect(&self, url: &str) -> Result<Session> {
+        self.limits.validate()?;
         let conn = websock_wasm::connect(url, self.opts.clone()).await?;
-        Ok(Session::new(conn, self.limits.clone()))
+        Session::new(conn, self.limits.clone())
     }
 }

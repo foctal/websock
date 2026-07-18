@@ -74,6 +74,12 @@ fn frame_encoded_len_matches_actual_size() {
 }
 
 #[test]
+fn stream_id_rejects_counter_overflow() {
+    assert!(StreamId::new(u64::MAX, false, StreamDir::Bi).is_err());
+    assert!(StreamId::new(1 << 62, true, StreamDir::Uni).is_err());
+}
+
+#[test]
 fn frame_decode_unknown_tag() {
     let mut buf = BytesMut::new();
     VarInt::from_u32(99).encode(&mut buf); // unknown tag

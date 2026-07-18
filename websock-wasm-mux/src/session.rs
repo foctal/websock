@@ -12,11 +12,11 @@ use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite}
 use futures_util::lock::Mutex;
 use futures_util::stream::Stream;
 use futures_util::task::AtomicWaker;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt, future::poll_fn};
 use wasm_bindgen_futures::spawn_local;
 use websock_proto::{Error, Message, Result};
 
-use websock_mux_proto::{Frame, StreamDir, StreamId};
+use websock_mux_proto::{Frame, StreamDir, StreamId, VarInt};
 
 const MAX_WRITE_CHUNK: usize = 16 * 1024;
 
@@ -50,18 +50,71 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_ws_message_size: 1 * 1024 * 1024,
+            max_ws_message_size: 1024 * 1024,
             max_stream_data_per_frame: 256 * 1024,
             max_open_streams: 1024,
             recv_event_queue_len: 128,
             outbound_queue_len: 256,
             max_batch_frames: 64,
-            max_batch_bytes: 256 * 1024,
+            max_batch_bytes: 512 * 1024,
             initial_stream_window: 512 * 1024,
             stream_window_update_threshold: 256 * 1024,
             accept_uni_queue_len: 128,
             accept_bi_queue_len: 128,
         }
+    }
+}
+
+impl Limits {
+    /// Validate that the limits are non-zero and internally consistent.
+    pub fn validate(&self) -> Result<()> {
+        let non_zero = [
+            ("max_ws_message_size", self.max_ws_message_size),
+            ("max_stream_data_per_frame", self.max_stream_data_per_frame),
+            ("max_open_streams", self.max_open_streams),
+            ("recv_event_queue_len", self.recv_event_queue_len),
+            ("outbound_queue_len", self.outbound_queue_len),
+            ("max_batch_frames", self.max_batch_frames),
+            ("max_batch_bytes", self.max_batch_bytes),
+            ("initial_stream_window", self.initial_stream_window),
+            (
+                "stream_window_update_threshold",
+                self.stream_window_update_threshold,
+            ),
+            ("accept_uni_queue_len", self.accept_uni_queue_len),
+            ("accept_bi_queue_len", self.accept_bi_queue_len),
+        ];
+        if let Some((name, _)) = non_zero.into_iter().find(|(_, value)| *value == 0) {
+            return Err(Error::Protocol(format!("{name} must be greater than zero")));
+        }
+        if self.max_stream_data_per_frame > self.max_ws_message_size {
+            return Err(Error::Protocol(
+                "max_stream_data_per_frame must not exceed max_ws_message_size".into(),
+            ));
+        }
+        if self.max_batch_bytes > self.max_ws_message_size {
+            return Err(Error::Protocol(
+                "max_batch_bytes must not exceed max_ws_message_size".into(),
+            ));
+        }
+        if self.max_batch_bytes < self.max_stream_data_per_frame.saturating_add(33) {
+            return Err(Error::Protocol(
+                "max_batch_bytes must accommodate a maximum-size stream frame".into(),
+            ));
+        }
+        if self.stream_window_update_threshold > self.initial_stream_window {
+            return Err(Error::Protocol(
+                "stream_window_update_threshold must not exceed initial_stream_window".into(),
+            ));
+        }
+        if self.max_ws_message_size as u64 > VarInt::MAX.into_inner()
+            || self.initial_stream_window as u64 > VarInt::MAX.into_inner()
+        {
+            return Err(Error::Protocol(
+                "byte and flow-control limits must fit in a mux varint".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -73,7 +126,8 @@ pub struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(conn: websock_wasm::Connection, limits: Limits) -> Self {
+    pub(crate) fn new(conn: websock_wasm::Connection, limits: Limits) -> Result<Self> {
+        limits.validate()?;
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundCmd>(limits.outbound_queue_len);
         let (accept_uni_tx, accept_uni_rx) =
             mpsc::channel::<RecvStream>(limits.accept_uni_queue_len);
@@ -94,29 +148,36 @@ impl Session {
         };
 
         inner.spawn_task(conn, outbound_rx);
-        session
+        Ok(session)
     }
 
     pub fn open_uni(&self) -> Result<SendStream> {
         let id = self.inner.next_stream_id(StreamDir::Uni)?;
-        let flow = self
-            .inner
-            .register_send_flow(id, self.inner.limits.initial_stream_window as u64);
-        self.inner.send_frame(Frame::OpenUni { id })?;
+        let flow = self.inner.register_send_flow(id, 0)?;
+        if let Err(err) = self.inner.send_frame(Frame::OpenUni { id }) {
+            self.inner.remove_send_flow(id);
+            return Err(err);
+        }
         Ok(SendStream::new(id, self.inner.clone(), flow))
     }
 
     pub fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         let id = self.inner.next_stream_id(StreamDir::Bi)?;
-        let flow = self
-            .inner
-            .register_send_flow(id, self.inner.limits.initial_stream_window as u64);
+        let flow = self.inner.register_send_flow(id, 0)?;
         let recv = self.inner.clone().register_recv_stream(id);
-        self.inner.send_frame(Frame::OpenBi { id })?;
-        self.inner.send_frame(Frame::MaxStreamData {
+        if let Err(err) = self.inner.send_frame(Frame::OpenBi { id }) {
+            self.inner.streams.borrow_mut().remove(&id);
+            self.inner.remove_send_flow(id);
+            return Err(err);
+        }
+        if let Err(err) = self.inner.send_frame(Frame::MaxStreamData {
             id,
             max: self.inner.limits.initial_stream_window as u64,
-        })?;
+        }) {
+            self.inner.streams.borrow_mut().remove(&id);
+            self.inner.remove_send_flow(id);
+            return Err(err);
+        }
         Ok((SendStream::new(id, self.inner.clone(), flow), recv))
     }
 
@@ -134,6 +195,7 @@ impl Session {
 struct SendFlowState {
     max_data: AtomicU64,
     sent_data: AtomicU64,
+    closed: AtomicBool,
     waker: AtomicWaker,
 }
 
@@ -142,6 +204,7 @@ impl SendFlowState {
         Self {
             max_data: AtomicU64::new(initial_max),
             sent_data: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
     }
@@ -177,6 +240,9 @@ impl SendFlowState {
     }
 
     fn update_max(&self, max: u64) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let mut current = self.max_data.load(Ordering::Acquire);
         while max > current {
             match self
@@ -190,6 +256,15 @@ impl SendFlowState {
                 Err(v) => current = v,
             }
         }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -217,12 +292,15 @@ impl SendStream {
         }
     }
 
-    pub fn write(&self, data: &[u8]) -> Result<()> {
-        self.write_buf(Bytes::copy_from_slice(data))
+    pub async fn write(&self, data: &[u8]) -> Result<()> {
+        self.write_buf(Bytes::copy_from_slice(data)).await
     }
 
-    pub fn write_buf(&self, data: Bytes) -> Result<()> {
-        if self.finished.load(Ordering::SeqCst) || self.session.closed.load(Ordering::SeqCst) {
+    pub async fn write_buf(&self, data: Bytes) -> Result<()> {
+        if self.finished.load(Ordering::SeqCst)
+            || self.flow.is_closed()
+            || self.session.closed.load(Ordering::SeqCst)
+        {
             return Err(Error::Closed);
         }
         let mut offset = 0usize;
@@ -233,29 +311,53 @@ impl SendStream {
             if wanted == 0 {
                 return Err(Error::Protocol("stream frame payload limit is zero".into()));
             }
-            let grant = self.flow.try_reserve(wanted);
-            if grant == 0 {
-                return Err(Error::Other("flow control blocked".into()));
-            }
+            let grant = poll_fn(|cx| {
+                self.flow.waker.register(cx.waker());
+                let grant = self.flow.try_reserve(wanted);
+                if grant == 0 {
+                    if self.flow.is_closed()
+                        || self.finished.load(Ordering::SeqCst)
+                        || self.session.closed.load(Ordering::SeqCst)
+                    {
+                        Poll::Ready(Err(Error::Closed))
+                    } else {
+                        Poll::Pending
+                    }
+                } else {
+                    Poll::Ready(Ok(grant))
+                }
+            })
+            .await?;
             let chunk = data.slice(offset..offset + grant);
-            if let Err(err) = self.session.send_frame(Frame::Stream {
-                id: self.id,
-                data: chunk,
-                fin: false,
-            }) {
+            let mut outbound = self.outbound.clone();
+            if outbound
+                .send(OutboundCmd::Frame(Frame::Stream {
+                    id: self.id,
+                    data: chunk,
+                    fin: false,
+                }))
+                .await
+                .is_err()
+            {
                 self.flow.release(grant);
-                return Err(err);
+                return Err(Error::Closed);
             }
             offset += grant;
         }
         Ok(())
     }
 
-    pub fn write_all(&self, data: &[u8]) -> Result<()> {
-        self.write(data)
+    pub async fn write_all(&self, data: &[u8]) -> Result<()> {
+        self.write(data).await
     }
 
-    pub fn finish(&self) -> Result<()> {
+    pub async fn finish(&self) -> Result<()> {
+        if self.finished.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.flow.is_closed() || self.session.closed.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
         if self
             .finished
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -271,7 +373,9 @@ impl SendStream {
         Ok(())
     }
 
-    pub fn reset(&self, code: u64) -> Result<()> {
+    pub async fn reset(&self, code: u64) -> Result<()> {
+        VarInt::from_u64(code)
+            .map_err(|_| Error::Protocol("reset code exceeds mux varint range".into()))?;
         self.finished.store(true, Ordering::SeqCst);
         self.session.remove_send_flow(self.id);
         self.session
@@ -280,6 +384,8 @@ impl SendStream {
 
     pub fn closed(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
+            || self.flow.is_closed()
+            || self.session.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -307,7 +413,10 @@ impl FuturesAsyncWrite for SendStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if this.finished.load(Ordering::SeqCst) || this.session.closed.load(Ordering::SeqCst) {
+        if this.finished.load(Ordering::SeqCst)
+            || this.flow.is_closed()
+            || this.session.closed.load(Ordering::SeqCst)
+        {
             return Poll::Ready(Err(io_closed()));
         }
 
@@ -322,7 +431,11 @@ impl FuturesAsyncWrite for SendStream {
             }
             let chunk_len = this.flow.try_reserve(wanted);
             if chunk_len == 0 {
-                return Poll::Pending;
+                return if this.flow.is_closed() || this.session.closed.load(Ordering::SeqCst) {
+                    Poll::Ready(Err(io_closed()))
+                } else {
+                    Poll::Pending
+                };
             }
 
             match this.outbound.poll_ready(cx) {
@@ -373,6 +486,11 @@ impl FuturesAsyncWrite for SendStream {
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if !this.finished.load(Ordering::SeqCst)
+            && (this.flow.is_closed() || this.session.closed.load(Ordering::SeqCst))
+        {
+            return Poll::Ready(Err(io_closed()));
+        }
 
         if !this.finished.load(Ordering::SeqCst) && !this.close_in_flight {
             match this.outbound.poll_ready(cx) {
@@ -404,6 +522,9 @@ impl FuturesAsyncWrite for SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
+        if Rc::strong_count(&self.finished) != 1 {
+            return;
+        }
         self.session.remove_send_flow(self.id);
         if !self.finished.load(Ordering::SeqCst) {
             let _ = self.session.try_send_frame(Frame::ResetStream {
@@ -420,6 +541,12 @@ struct RecvEvent {
     fin: bool,
 }
 
+struct RecvState {
+    sender: mpsc::Sender<RecvEvent>,
+    received: u64,
+    max_data: Rc<AtomicU64>,
+}
+
 pub struct RecvStream {
     id: StreamId,
     session: Rc<SessionInner>,
@@ -430,6 +557,8 @@ pub struct RecvStream {
     granted: u64,
     initial_window: u64,
     update_threshold: u64,
+    max_data: Rc<AtomicU64>,
+    stop_sent: AtomicBool,
 }
 
 impl RecvStream {
@@ -439,6 +568,7 @@ impl RecvStream {
         receiver: mpsc::Receiver<RecvEvent>,
         initial_window: u64,
         update_threshold: u64,
+        max_data: Rc<AtomicU64>,
     ) -> Self {
         Self {
             id,
@@ -450,6 +580,8 @@ impl RecvStream {
             granted: initial_window,
             initial_window,
             update_threshold,
+            max_data,
+            stop_sent: AtomicBool::new(false),
         }
     }
 
@@ -458,7 +590,10 @@ impl RecvStream {
             return;
         }
         self.consumed = self.consumed.saturating_add(n as u64);
-        let target = self.consumed.saturating_add(self.initial_window);
+        let target = self
+            .consumed
+            .saturating_add(self.initial_window)
+            .min(VarInt::MAX.into_inner());
         if target <= self.granted {
             return;
         }
@@ -474,14 +609,15 @@ impl RecvStream {
             .is_ok()
         {
             self.granted = target;
+            self.max_data.store(target, Ordering::Release);
         }
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
-        if self.finished {
-            return Ok(None);
-        }
         if self.pending.is_empty() {
+            if self.finished {
+                return Ok(None);
+            }
             if let Some(chunk) = self.read_chunk_internal().await? {
                 self.pending = chunk;
             } else {
@@ -496,13 +632,13 @@ impl RecvStream {
     }
 
     pub async fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Result<Option<usize>> {
-        if self.finished {
-            return Ok(None);
-        }
         if buf.remaining_mut() == 0 {
             return Ok(Some(0));
         }
         if self.pending.is_empty() {
+            if self.finished {
+                return Ok(None);
+            }
             if let Some(chunk) = self.read_chunk_internal().await? {
                 self.pending = chunk;
             } else {
@@ -537,6 +673,20 @@ impl RecvStream {
     }
 
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>> {
+        if max == 0 {
+            return Err(Error::Protocol(
+                "read_chunk max must be greater than zero".into(),
+            ));
+        }
+        if !self.pending.is_empty() {
+            let amount = self.pending.len().min(max);
+            let chunk = self.pending.split_to(amount);
+            self.on_bytes_consumed(chunk.len());
+            return Ok(Some(chunk));
+        }
+        if self.finished {
+            return Ok(None);
+        }
         match self.receiver.next().await {
             Some(mut event) => {
                 if event.fin {
@@ -562,6 +712,12 @@ impl RecvStream {
     }
 
     pub fn stop(&self, code: u64) -> Result<()> {
+        VarInt::from_u64(code)
+            .map_err(|_| Error::Protocol("stop code exceeds mux varint range".into()))?;
+        if self.stop_sent.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.session.streams.borrow_mut().remove(&self.id);
         self.session
             .send_frame(Frame::StopSending { id: self.id, code })
     }
@@ -573,7 +729,8 @@ impl RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if !self.finished {
+        self.session.streams.borrow_mut().remove(&self.id);
+        if !self.finished && !self.stop_sent.swap(true, Ordering::SeqCst) {
             let _ = self.session.try_send_frame(Frame::StopSending {
                 id: self.id,
                 code: 0,
@@ -646,10 +803,12 @@ struct SessionInner {
     outbound_tx: RefCell<mpsc::Sender<OutboundCmd>>,
     accept_uni_tx: Mutex<Option<mpsc::Sender<RecvStream>>>,
     accept_bi_tx: Mutex<Option<mpsc::Sender<(SendStream, RecvStream)>>>,
-    streams: RefCell<HashMap<StreamId, mpsc::Sender<RecvEvent>>>,
+    streams: RefCell<HashMap<StreamId, RecvState>>,
     send_flows: RefCell<HashMap<StreamId, Rc<SendFlowState>>>,
     next_uni: AtomicU64,
     next_bi: AtomicU64,
+    next_peer_uni: AtomicU64,
+    next_peer_bi: AtomicU64,
     closed: AtomicBool,
 }
 
@@ -669,6 +828,8 @@ impl SessionInner {
             send_flows: RefCell::new(HashMap::new()),
             next_uni: AtomicU64::new(0),
             next_bi: AtomicU64::new(0),
+            next_peer_uni: AtomicU64::new(0),
+            next_peer_bi: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }
     }
@@ -784,19 +945,29 @@ impl SessionInner {
                 if !id.initiator_is_server() {
                     return self.protocol_error(1, "OpenUni with wrong initiator").await;
                 }
-
-                let mut map = self.streams.borrow_mut();
-                if map.len() >= self.limits.max_open_streams {
-                    drop(map);
-                    return self.protocol_error(3, "too many open streams").await;
-                }
-                if map.contains_key(&id) {
-                    drop(map);
-                    return self.protocol_error(1, "duplicate stream open").await;
+                if !self.validate_peer_stream_id(id) {
+                    return self
+                        .protocol_error(1, "OpenUni with non-monotonic StreamId")
+                        .await;
                 }
 
-                let recv = Self::register_recv_stream_locked(&self, &mut map, id);
-                drop(map);
+                let validation = {
+                    let map = self.streams.borrow();
+                    if map.len() >= self.limits.max_open_streams {
+                        Err((3, "too many open streams"))
+                    } else if map.contains_key(&id) {
+                        Err((1, "duplicate stream open"))
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err((code, reason)) = validation {
+                    return self.protocol_error(code, reason).await;
+                }
+                let recv = {
+                    let mut map = self.streams.borrow_mut();
+                    Self::register_recv_stream_locked(self, &mut map, id)
+                };
                 let _ = self.try_send_frame(Frame::MaxStreamData {
                     id,
                     max: self.limits.initial_stream_window as u64,
@@ -827,25 +998,38 @@ impl SessionInner {
                 if !id.initiator_is_server() {
                     return self.protocol_error(1, "OpenBi with wrong initiator").await;
                 }
-
-                let mut map = self.streams.borrow_mut();
-                if map.len() >= self.limits.max_open_streams {
-                    drop(map);
-                    return self.protocol_error(3, "too many open streams").await;
-                }
-                if map.contains_key(&id) {
-                    drop(map);
-                    return self.protocol_error(1, "duplicate stream open").await;
+                if !self.validate_peer_stream_id(id) {
+                    return self
+                        .protocol_error(1, "OpenBi with non-monotonic StreamId")
+                        .await;
                 }
 
-                let recv = Self::register_recv_stream_locked(&self, &mut map, id);
-                drop(map);
+                let validation = {
+                    let map = self.streams.borrow();
+                    if map.len() >= self.limits.max_open_streams {
+                        Err((3, "too many open streams"))
+                    } else if map.contains_key(&id) {
+                        Err((1, "duplicate stream open"))
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err((code, reason)) = validation {
+                    return self.protocol_error(code, reason).await;
+                }
+                let recv = {
+                    let mut map = self.streams.borrow_mut();
+                    Self::register_recv_stream_locked(self, &mut map, id)
+                };
                 let _ = self.try_send_frame(Frame::MaxStreamData {
                     id,
                     max: self.limits.initial_stream_window as u64,
                 });
 
-                let flow = self.register_send_flow(id, self.limits.initial_stream_window as u64);
+                let flow = match self.register_send_flow(id, 0) {
+                    Ok(flow) => flow,
+                    Err(err) => return self.protocol_error(3, &err.to_string()).await,
+                };
                 let send = SendStream::new(id, self.clone(), flow);
                 let tx = self.accept_bi_tx.lock().await.clone();
                 if let Some(mut tx) = tx {
@@ -870,40 +1054,49 @@ impl SessionInner {
                     return self.protocol_error(2, "stream data too large").await;
                 }
 
-                let mut map = self.streams.borrow_mut();
-                let Some(tx) = map.get_mut(&id) else {
-                    drop(map);
-                    return self
-                        .protocol_error(1, "Stream data on unknown stream")
-                        .await;
-                };
-
-                match tx.try_send(RecvEvent { data, fin }) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        if e.is_full() {
-                            map.remove(&id);
-                            drop(map);
-                            let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                            return Ok(());
-                        } else {
-                            map.remove(&id);
-                            return Ok(());
-                        }
+                let result = {
+                    let mut map = self.streams.borrow_mut();
+                    match map.get_mut(&id) {
+                        None => Err("Stream data on unknown stream"),
+                        Some(state) => match state.received.checked_add(data.len() as u64) {
+                            None => Err("stream data overflow"),
+                            Some(received) if received > state.max_data.load(Ordering::Acquire) => {
+                                Err("stream flow-control limit exceeded")
+                            }
+                            Some(received) => {
+                                state.received = received;
+                                let (remove, reset) =
+                                    match state.sender.try_send(RecvEvent { data, fin }) {
+                                        Ok(()) => (fin, false),
+                                        Err(error) => (true, error.is_full()),
+                                    };
+                                if remove {
+                                    map.remove(&id);
+                                };
+                                Ok(reset)
+                            }
+                        },
                     }
-                }
-
-                if fin {
-                    self.remove_send_flow(id);
-                    map.remove(&id);
+                };
+                let reset = match result {
+                    Ok(reset) => reset,
+                    Err(reason) => return self.protocol_error(2, reason).await,
+                };
+                if reset {
+                    let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
                 }
                 Ok(())
             }
-            Frame::ResetStream { id, .. } | Frame::StopSending { id, .. } => {
-                let removed_recv = self.streams.borrow_mut().remove(&id).is_some();
-                let removed_send = self.send_flows.borrow_mut().remove(&id).is_some();
-                if !removed_recv && !removed_send {
-                    return self.protocol_error(1, "reset/stop on unknown stream").await;
+            Frame::ResetStream { id, .. } => {
+                let removed = { self.streams.borrow_mut().remove(&id).is_some() };
+                if !removed {
+                    return self.protocol_error(1, "reset on unknown stream").await;
+                }
+                Ok(())
+            }
+            Frame::StopSending { id, .. } => {
+                if !self.remove_send_flow(id) {
+                    return self.protocol_error(1, "stop on unknown stream").await;
                 }
                 Ok(())
             }
@@ -927,28 +1120,49 @@ impl SessionInner {
 
     fn register_recv_stream_locked(
         this: &Rc<Self>,
-        map: &mut HashMap<StreamId, mpsc::Sender<RecvEvent>>,
+        map: &mut HashMap<StreamId, RecvState>,
         id: StreamId,
     ) -> RecvStream {
         let (tx, rx) = mpsc::channel(this.limits.recv_event_queue_len);
-        map.insert(id, tx);
+        let max_data = Rc::new(AtomicU64::new(this.limits.initial_stream_window as u64));
+        map.insert(
+            id,
+            RecvState {
+                sender: tx,
+                received: 0,
+                max_data: max_data.clone(),
+            },
+        );
         RecvStream::new(
             id,
             this.clone(),
             rx,
             this.limits.initial_stream_window as u64,
             this.limits.stream_window_update_threshold as u64,
+            max_data,
         )
     }
 
-    fn register_send_flow(&self, id: StreamId, initial_max: u64) -> Rc<SendFlowState> {
+    fn register_send_flow(&self, id: StreamId, initial_max: u64) -> Result<Rc<SendFlowState>> {
         let flow = Rc::new(SendFlowState::new(initial_max));
-        self.send_flows.borrow_mut().insert(id, flow.clone());
-        flow
+        let mut send_flows = self.send_flows.borrow_mut();
+        if send_flows.len() >= self.limits.max_open_streams {
+            return Err(Error::Protocol("too many open send streams".into()));
+        }
+        if send_flows.contains_key(&id) {
+            return Err(Error::Protocol("duplicate send stream".into()));
+        }
+        send_flows.insert(id, flow.clone());
+        Ok(flow)
     }
 
-    fn remove_send_flow(&self, id: StreamId) {
-        self.send_flows.borrow_mut().remove(&id);
+    fn remove_send_flow(&self, id: StreamId) -> bool {
+        if let Some(flow) = self.send_flows.borrow_mut().remove(&id) {
+            flow.close();
+            true
+        } else {
+            false
+        }
     }
 
     fn try_send_frame(&self, frame: Frame) -> std::result::Result<(), Error> {
@@ -981,23 +1195,51 @@ impl SessionInner {
         }
 
         self.streams.borrow_mut().clear();
-        self.send_flows.borrow_mut().clear();
+        {
+            let mut send_flows = self.send_flows.borrow_mut();
+            for flow in send_flows.values() {
+                flow.close();
+            }
+            send_flows.clear();
+        }
         *self.accept_uni_tx.lock().await = None;
         *self.accept_bi_tx.lock().await = None;
+    }
+
+    fn validate_peer_stream_id(&self, id: StreamId) -> bool {
+        let next = match id.dir() {
+            StreamDir::Uni => &self.next_peer_uni,
+            StreamDir::Bi => &self.next_peer_bi,
+        };
+        let mut current = next.load(Ordering::SeqCst);
+        loop {
+            if id.counter() < current {
+                return false;
+            }
+            match next.compare_exchange(
+                current,
+                id.counter().saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
 impl websock_mux_proto::MuxSendStream for SendStream {
     fn write_buf<'a>(&'a self, data: Bytes) -> websock_proto::LocalBoxFuture<'a, Result<()>> {
-        Box::pin(async move { SendStream::write_buf(self, data) })
+        Box::pin(async move { SendStream::write_buf(self, data).await })
     }
 
     fn finish<'a>(&'a self) -> websock_proto::LocalBoxFuture<'a, Result<()>> {
-        Box::pin(async move { SendStream::finish(self) })
+        Box::pin(async move { SendStream::finish(self).await })
     }
 
     fn reset<'a>(&'a self, code: u64) -> websock_proto::LocalBoxFuture<'a, Result<()>> {
-        Box::pin(async move { SendStream::reset(self, code) })
+        Box::pin(async move { SendStream::reset(self, code).await })
     }
 
     fn closed(&self) -> bool {

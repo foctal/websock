@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite;
 use tokio_util::sync::PollSender;
 use websock_proto::{Error, Result};
 
+use websock_mux_proto::VarInt;
 use websock_mux_proto::stream::{Frame, StreamDir, StreamId};
 
 const MAX_WRITE_CHUNK: usize = 16 * 1024;
@@ -58,12 +59,75 @@ impl Default for Limits {
             recv_event_queue_len: 128,
             outbound_queue_len: 256,
             max_batch_frames: 64,
-            max_batch_bytes: 256 * 1024,
+            max_batch_bytes: 512 * 1024,
             initial_stream_window: 512 * 1024,
             stream_window_update_threshold: 256 * 1024,
             accept_uni_queue_len: 128,
             accept_bi_queue_len: 128,
         }
+    }
+}
+
+impl Limits {
+    /// Validate that the limits are non-zero and internally consistent.
+    pub fn validate(&self) -> Result<()> {
+        let non_zero = [
+            ("max_ws_message_size", self.max_ws_message_size),
+            ("max_stream_data_per_frame", self.max_stream_data_per_frame),
+            ("max_open_streams", self.max_open_streams),
+            ("recv_event_queue_len", self.recv_event_queue_len),
+            ("outbound_queue_len", self.outbound_queue_len),
+            ("max_batch_frames", self.max_batch_frames),
+            ("max_batch_bytes", self.max_batch_bytes),
+            ("initial_stream_window", self.initial_stream_window),
+            (
+                "stream_window_update_threshold",
+                self.stream_window_update_threshold,
+            ),
+            ("accept_uni_queue_len", self.accept_uni_queue_len),
+            ("accept_bi_queue_len", self.accept_bi_queue_len),
+        ];
+        if let Some((name, _)) = non_zero.into_iter().find(|(_, value)| *value == 0) {
+            return Err(Error::Protocol(format!("{name} must be greater than zero")));
+        }
+        if self.max_stream_data_per_frame > self.max_ws_message_size {
+            return Err(Error::Protocol(
+                "max_stream_data_per_frame must not exceed max_ws_message_size".into(),
+            ));
+        }
+        if self.max_batch_bytes > self.max_ws_message_size {
+            return Err(Error::Protocol(
+                "max_batch_bytes must not exceed max_ws_message_size".into(),
+            ));
+        }
+        if self.max_batch_bytes < self.max_stream_data_per_frame.saturating_add(33) {
+            return Err(Error::Protocol(
+                "max_batch_bytes must accommodate a maximum-size stream frame".into(),
+            ));
+        }
+        if self.stream_window_update_threshold > self.initial_stream_window {
+            return Err(Error::Protocol(
+                "stream_window_update_threshold must not exceed initial_stream_window".into(),
+            ));
+        }
+        if self.max_ws_message_size as u64 > VarInt::MAX.into_inner()
+            || self.initial_stream_window as u64 > VarInt::MAX.into_inner()
+        {
+            return Err(Error::Protocol(
+                "byte and flow-control limits must fit in a mux varint".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn websocket_config(&self) -> tungstenite::protocol::WebSocketConfig {
+        let buffer_size = self.max_ws_message_size.min(128 * 1024);
+        tungstenite::protocol::WebSocketConfig::default()
+            .read_buffer_size(buffer_size)
+            .write_buffer_size(buffer_size)
+            .max_write_buffer_size(buffer_size.saturating_add(self.max_ws_message_size))
+            .max_message_size(Some(self.max_ws_message_size))
+            .max_frame_size(Some(self.max_ws_message_size))
     }
 }
 
@@ -83,6 +147,7 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        limits.validate()?;
         let (outbound_tx, outbound_rx) = mpsc::channel(limits.outbound_queue_len);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(limits.accept_uni_queue_len);
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel(limits.accept_bi_queue_len);
@@ -107,23 +172,28 @@ impl Session {
 
     pub async fn open_uni(&self) -> Result<SendStream> {
         let id = self.inner.next_stream_id(StreamDir::Uni)?;
-        let flow = self
-            .inner
-            .register_send_flow(id, self.inner.limits.initial_stream_window as u64)
-            .await;
-        self.inner.send_frame(Frame::OpenUni { id }).await?;
+        let flow = self.inner.register_send_flow(id, 0).await?;
+        if let Err(err) = self.inner.send_frame(Frame::OpenUni { id }).await {
+            self.inner.remove_send_flow(id);
+            return Err(err);
+        }
         Ok(SendStream::new(id, self.inner.clone(), flow))
     }
 
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         let id = self.inner.next_stream_id(StreamDir::Bi)?;
-        let flow = self
-            .inner
-            .register_send_flow(id, self.inner.limits.initial_stream_window as u64)
-            .await;
+        let flow = self.inner.register_send_flow(id, 0).await?;
         let recv = self.inner.register_recv_stream(id).await;
-        self.inner.send_frame(Frame::OpenBi { id }).await?;
-        self.inner.send_initial_credit(id).await?;
+        if let Err(err) = self.inner.send_frame(Frame::OpenBi { id }).await {
+            self.inner.remove_stream(id).await;
+            self.inner.remove_send_flow(id);
+            return Err(err);
+        }
+        if let Err(err) = self.inner.send_initial_credit(id).await {
+            self.inner.remove_stream(id).await;
+            self.inner.remove_send_flow(id);
+            return Err(err);
+        }
         Ok((SendStream::new(id, self.inner.clone(), flow), recv))
     }
 
@@ -141,6 +211,7 @@ impl Session {
 struct SendFlowState {
     max_data: AtomicU64,
     sent_data: AtomicU64,
+    closed: AtomicBool,
     waker: AtomicWaker,
 }
 
@@ -149,6 +220,7 @@ impl SendFlowState {
         Self {
             max_data: AtomicU64::new(initial_max),
             sent_data: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
     }
@@ -185,6 +257,9 @@ impl SendFlowState {
     }
 
     fn update_max(&self, max: u64) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let mut current = self.max_data.load(Ordering::Acquire);
         while max > current {
             match self
@@ -198,6 +273,15 @@ impl SendFlowState {
                 Err(v) => current = v,
             }
         }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -248,7 +332,10 @@ impl SendStream {
                 self.flow.waker.register(cx.waker());
                 let n = self.flow.try_reserve(wanted);
                 if n == 0 {
-                    if self.finished.load(Ordering::SeqCst) || self.session.is_closed() {
+                    if self.finished.load(Ordering::SeqCst)
+                        || self.flow.is_closed()
+                        || self.session.is_closed()
+                    {
                         Poll::Ready(Err(Error::Closed))
                     } else {
                         Poll::Pending
@@ -282,6 +369,12 @@ impl SendStream {
     }
 
     pub async fn finish(&self) -> Result<()> {
+        if self.finished.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.flow.is_closed() || self.session.is_closed() {
+            return Err(Error::Closed);
+        }
         if self
             .finished
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -300,6 +393,8 @@ impl SendStream {
     }
 
     pub async fn reset(&self, code: u64) -> Result<()> {
+        VarInt::from_u64(code)
+            .map_err(|_| Error::Protocol("reset code exceeds mux varint range".into()))?;
         self.finished.store(true, Ordering::SeqCst);
         self.session.remove_send_flow(self.id);
         self.session
@@ -308,7 +403,7 @@ impl SendStream {
     }
 
     pub fn closed(&self) -> bool {
-        self.finished.load(Ordering::SeqCst)
+        self.finished.load(Ordering::SeqCst) || self.flow.is_closed() || self.session.is_closed()
     }
 }
 
@@ -337,7 +432,8 @@ impl AsyncWrite for SendStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if this.finished.load(Ordering::SeqCst) || this.session.is_closed() {
+        if this.finished.load(Ordering::SeqCst) || this.flow.is_closed() || this.session.is_closed()
+        {
             return Poll::Ready(Err(io_closed()));
         }
 
@@ -351,7 +447,11 @@ impl AsyncWrite for SendStream {
         }
         let chunk_len = this.flow.try_reserve(wanted_len);
         if chunk_len == 0 {
-            return Poll::Pending;
+            return if this.flow.is_closed() || this.session.is_closed() {
+                Poll::Ready(Err(io_closed()))
+            } else {
+                Poll::Pending
+            };
         }
 
         match this.outbound.poll_reserve(cx) {
@@ -422,6 +522,11 @@ impl AsyncWrite for SendStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if !this.finished.load(Ordering::SeqCst)
+            && (this.flow.is_closed() || this.session.is_closed())
+        {
+            return Poll::Ready(Err(io_closed()));
+        }
 
         if !this.finished.load(Ordering::SeqCst) && !this.fin_queued {
             match this.outbound.poll_reserve(cx) {
@@ -449,6 +554,9 @@ impl AsyncWrite for SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.finished) != 1 {
+            return;
+        }
         self.session.remove_send_flow(self.id);
         if !self.finished.load(Ordering::SeqCst) {
             let _ = self.session.try_send_frame(Frame::ResetStream {
@@ -465,6 +573,12 @@ struct RecvEvent {
     fin: bool,
 }
 
+struct RecvState {
+    sender: mpsc::Sender<RecvEvent>,
+    received: u64,
+    max_data: Arc<AtomicU64>,
+}
+
 pub struct RecvStream {
     id: StreamId,
     session: Arc<SessionInner>,
@@ -475,6 +589,8 @@ pub struct RecvStream {
     granted: u64,
     initial_window: u64,
     update_threshold: u64,
+    max_data: Arc<AtomicU64>,
+    stop_sent: AtomicBool,
 }
 
 impl RecvStream {
@@ -484,6 +600,7 @@ impl RecvStream {
         receiver: mpsc::Receiver<RecvEvent>,
         initial_window: u64,
         update_threshold: u64,
+        max_data: Arc<AtomicU64>,
     ) -> Self {
         Self {
             id,
@@ -495,6 +612,8 @@ impl RecvStream {
             granted: initial_window,
             initial_window,
             update_threshold,
+            max_data,
+            stop_sent: AtomicBool::new(false),
         }
     }
 
@@ -503,7 +622,10 @@ impl RecvStream {
             return;
         }
         self.consumed = self.consumed.saturating_add(n as u64);
-        let target = self.consumed.saturating_add(self.initial_window);
+        let target = self
+            .consumed
+            .saturating_add(self.initial_window)
+            .min(VarInt::MAX.into_inner());
         if target <= self.granted {
             return;
         }
@@ -519,14 +641,15 @@ impl RecvStream {
             .is_ok()
         {
             self.granted = target;
+            self.max_data.store(target, Ordering::Release);
         }
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
-        if self.finished {
-            return Ok(None);
-        }
         if self.pending.is_empty() {
+            if self.finished {
+                return Ok(None);
+            }
             if let Some(chunk) = self.read_chunk_internal().await? {
                 self.pending = chunk;
             } else {
@@ -541,13 +664,13 @@ impl RecvStream {
     }
 
     pub async fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Result<Option<usize>> {
-        if self.finished {
-            return Ok(None);
-        }
         if buf.remaining_mut() == 0 {
             return Ok(Some(0));
         }
         if self.pending.is_empty() {
+            if self.finished {
+                return Ok(None);
+            }
             if let Some(chunk) = self.read_chunk_internal().await? {
                 self.pending = chunk;
             } else {
@@ -582,6 +705,20 @@ impl RecvStream {
     }
 
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>> {
+        if max == 0 {
+            return Err(Error::Protocol(
+                "read_chunk max must be greater than zero".into(),
+            ));
+        }
+        if !self.pending.is_empty() {
+            let amount = self.pending.len().min(max);
+            let chunk = self.pending.split_to(amount);
+            self.on_bytes_consumed(chunk.len());
+            return Ok(Some(chunk));
+        }
+        if self.finished {
+            return Ok(None);
+        }
         match self.receiver.recv().await {
             Some(mut event) => {
                 if event.fin {
@@ -607,6 +744,12 @@ impl RecvStream {
     }
 
     pub async fn stop(&self, code: u64) -> Result<()> {
+        VarInt::from_u64(code)
+            .map_err(|_| Error::Protocol("stop code exceeds mux varint range".into()))?;
+        if self.stop_sent.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.session.remove_recv_stream(self.id);
         self.session
             .send_frame(Frame::StopSending { id: self.id, code })
             .await
@@ -619,7 +762,8 @@ impl RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if !self.finished {
+        self.session.remove_recv_stream(self.id);
+        if !self.finished && !self.stop_sent.swap(true, Ordering::SeqCst) {
             let _ = self.session.try_send_frame(Frame::StopSending {
                 id: self.id,
                 code: 0,
@@ -694,10 +838,12 @@ pub(crate) struct SessionInner {
     outbound_tx: mpsc::Sender<OutboundCmd>,
     accept_uni_tx: Mutex<Option<mpsc::Sender<RecvStream>>>,
     accept_bi_tx: Mutex<Option<mpsc::Sender<(SendStream, RecvStream)>>>,
-    streams: Mutex<HashMap<StreamId, mpsc::Sender<RecvEvent>>>,
-    send_flows: Mutex<HashMap<StreamId, Arc<SendFlowState>>>,
+    streams: StdMutex<HashMap<StreamId, RecvState>>,
+    send_flows: StdMutex<HashMap<StreamId, Arc<SendFlowState>>>,
     next_uni: AtomicU64,
     next_bi: AtomicU64,
+    next_peer_uni: AtomicU64,
+    next_peer_bi: AtomicU64,
     closed: AtomicBool,
 }
 
@@ -715,10 +861,12 @@ impl SessionInner {
             outbound_tx,
             accept_uni_tx: Mutex::new(Some(accept_uni_tx)),
             accept_bi_tx: Mutex::new(Some(accept_bi_tx)),
-            streams: Mutex::new(HashMap::new()),
-            send_flows: Mutex::new(HashMap::new()),
+            streams: StdMutex::new(HashMap::new()),
+            send_flows: StdMutex::new(HashMap::new()),
             next_uni: AtomicU64::new(0),
             next_bi: AtomicU64::new(0),
+            next_peer_uni: AtomicU64::new(0),
+            next_peer_bi: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }
     }
@@ -865,6 +1013,11 @@ impl SessionInner {
                 if id.initiator_is_server() != self.peer_is_server() {
                     return self.protocol_error(1, "OpenUni with wrong initiator").await;
                 }
+                if !self.validate_peer_stream_id(id) {
+                    return self
+                        .protocol_error(1, "OpenUni with non-monotonic StreamId")
+                        .await;
+                }
 
                 let recv = match self.try_register_inbound_recv_stream(id).await {
                     Ok(recv) => recv,
@@ -878,7 +1031,7 @@ impl SessionInner {
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             // Application is not accepting inbound streams fast enough.
                             // Reset this stream and keep the connection alive.
-                            let mut streams = self.streams.lock().await;
+                            let mut streams = self.lock_streams();
                             streams.remove(&id);
                             let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
                             return Ok(());
@@ -896,14 +1049,20 @@ impl SessionInner {
                 if id.initiator_is_server() != self.peer_is_server() {
                     return self.protocol_error(1, "OpenBi with wrong initiator").await;
                 }
+                if !self.validate_peer_stream_id(id) {
+                    return self
+                        .protocol_error(1, "OpenBi with non-monotonic StreamId")
+                        .await;
+                }
 
                 let recv = match self.try_register_inbound_recv_stream(id).await {
                     Ok(recv) => recv,
                     Err((code, reason)) => return self.protocol_error(code, reason).await,
                 };
-                let flow = self
-                    .register_send_flow(id, self.limits.initial_stream_window as u64)
-                    .await;
+                let flow = match self.register_send_flow(id, 0).await {
+                    Ok(flow) => flow,
+                    Err(err) => return self.protocol_error(3, err.to_string()).await,
+                };
                 let send = SendStream::new(id, self.clone(), flow);
 
                 let tx = { self.accept_bi_tx.lock().await.clone() };
@@ -911,7 +1070,7 @@ impl SessionInner {
                     match tx.try_send((send, recv)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            let mut streams = self.streams.lock().await;
+                            let mut streams = self.lock_streams();
                             streams.remove(&id);
                             let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
                             return Ok(());
@@ -927,47 +1086,63 @@ impl SessionInner {
                     return self.protocol_error(2, "stream data too large").await;
                 }
                 let tx = {
-                    let streams = self.streams.lock().await;
-                    streams.get(&id).cloned()
+                    let mut streams = self.lock_streams();
+                    match streams.get_mut(&id) {
+                        None => Err("Stream data on unknown stream"),
+                        Some(state) => match state.received.checked_add(data.len() as u64) {
+                            None => Err("stream data overflow"),
+                            Some(received) if received > state.max_data.load(Ordering::Acquire) => {
+                                Err("stream flow-control limit exceeded")
+                            }
+                            Some(received) => {
+                                state.received = received;
+                                Ok(state.sender.clone())
+                            }
+                        },
+                    }
                 };
-                let Some(tx) = tx else {
-                    return self
-                        .protocol_error(1, "Stream data on unknown stream")
-                        .await;
+                let tx = match tx {
+                    Ok(tx) => tx,
+                    Err(reason) => return self.protocol_error(2, reason).await,
                 };
-                if tx.send(RecvEvent { data, fin }).await.is_err() {
-                    let mut streams = self.streams.lock().await;
-                    streams.remove(&id);
-                    return Ok(());
+                match tx.try_send(RecvEvent { data, fin }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.remove_recv_stream(id);
+                        let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
+                        return Ok(());
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.remove_recv_stream(id);
+                        return Ok(());
+                    }
                 }
 
                 if fin {
-                    self.remove_send_flow(id);
-                    let mut streams = self.streams.lock().await;
+                    let mut streams = self.lock_streams();
                     streams.remove(&id);
                 }
             }
-            Frame::ResetStream { id, .. } | Frame::StopSending { id, .. } => {
-                let mut streams = self.streams.lock().await;
-                let removed_recv = streams.remove(&id).is_some();
-                drop(streams);
-                let mut send_flows = self.send_flows.lock().await;
-                let removed_send = send_flows.remove(&id).is_some();
-                if !removed_recv && !removed_send {
-                    return self.protocol_error(1, "reset/stop on unknown stream").await;
+            Frame::ResetStream { id, .. } => {
+                let removed = { self.lock_streams().remove(&id).is_some() };
+                if !removed {
+                    return self.protocol_error(1, "reset on unknown stream").await;
+                }
+            }
+            Frame::StopSending { id, .. } => {
+                if !self.remove_send_flow(id) {
+                    return self.protocol_error(1, "stop on unknown stream").await;
                 }
             }
             Frame::MaxStreamData { id, max } => {
-                let flows = self.send_flows.lock().await;
+                let flows = self.lock_send_flows();
                 if let Some(flow) = flows.get(&id) {
                     flow.update_max(max);
                 }
             }
             Frame::ConnectionClose { .. } => {
-                let mut streams = self.streams.lock().await;
-                streams.clear();
-                let mut send_flows = self.send_flows.lock().await;
-                send_flows.clear();
+                self.close_all().await;
+                return Err(Error::Closed);
             }
         }
         Ok(())
@@ -978,15 +1153,24 @@ impl SessionInner {
         id: StreamId,
     ) -> std::result::Result<RecvStream, (u64, &'static str)> {
         let (tx, rx) = mpsc::channel(self.limits.recv_event_queue_len);
-        let mut streams = self.streams.lock().await;
-        if streams.len() >= self.limits.max_open_streams {
-            return Err((3, "too many open streams"));
+        let max_data = Arc::new(AtomicU64::new(self.limits.initial_stream_window as u64));
+        {
+            let mut streams = self.lock_streams();
+            if streams.len() >= self.limits.max_open_streams {
+                return Err((3, "too many open streams"));
+            }
+            if streams.contains_key(&id) {
+                return Err((1, "duplicate stream open"));
+            }
+            streams.insert(
+                id,
+                RecvState {
+                    sender: tx,
+                    received: 0,
+                    max_data: max_data.clone(),
+                },
+            );
         }
-        if streams.contains_key(&id) {
-            return Err((1, "duplicate stream open"));
-        }
-        streams.insert(id, tx);
-        drop(streams);
 
         let initial_window = self.limits.initial_stream_window as u64;
         let recv = RecvStream::new(
@@ -995,6 +1179,7 @@ impl SessionInner {
             rx,
             initial_window,
             self.limits.stream_window_update_threshold as u64,
+            max_data,
         );
         self.send_frame(Frame::MaxStreamData {
             id,
@@ -1007,8 +1192,16 @@ impl SessionInner {
 
     pub(crate) async fn register_recv_stream(self: &Arc<Self>, id: StreamId) -> RecvStream {
         let (tx, rx) = mpsc::channel(self.limits.recv_event_queue_len);
-        let mut streams = self.streams.lock().await;
-        streams.insert(id, tx);
+        let max_data = Arc::new(AtomicU64::new(self.limits.initial_stream_window as u64));
+        let mut streams = self.lock_streams();
+        streams.insert(
+            id,
+            RecvState {
+                sender: tx,
+                received: 0,
+                max_data: max_data.clone(),
+            },
+        );
         drop(streams);
         let initial_window = self.limits.initial_stream_window as u64;
         RecvStream::new(
@@ -1017,6 +1210,7 @@ impl SessionInner {
             rx,
             initial_window,
             self.limits.stream_window_update_threshold as u64,
+            max_data,
         )
     }
 
@@ -1036,17 +1230,38 @@ impl SessionInner {
         StreamId::new(counter, self.is_server, dir).map_err(|e| Error::StreamId(e.to_string()))
     }
 
-    async fn register_send_flow(&self, id: StreamId, initial_max: u64) -> Arc<SendFlowState> {
+    async fn register_send_flow(
+        &self,
+        id: StreamId,
+        initial_max: u64,
+    ) -> Result<Arc<SendFlowState>> {
         let flow = Arc::new(SendFlowState::new(initial_max));
-        let mut send_flows = self.send_flows.lock().await;
+        let mut send_flows = self.lock_send_flows();
+        if send_flows.len() >= self.limits.max_open_streams {
+            return Err(Error::Protocol("too many open send streams".into()));
+        }
+        if send_flows.contains_key(&id) {
+            return Err(Error::Protocol("duplicate send stream".into()));
+        }
         send_flows.insert(id, flow.clone());
-        flow
+        Ok(flow)
     }
 
-    fn remove_send_flow(&self, id: StreamId) {
-        if let Ok(mut send_flows) = self.send_flows.try_lock() {
-            send_flows.remove(&id);
+    fn remove_send_flow(&self, id: StreamId) -> bool {
+        if let Some(flow) = self.lock_send_flows().remove(&id) {
+            flow.close();
+            true
+        } else {
+            false
         }
+    }
+
+    async fn remove_stream(&self, id: StreamId) {
+        self.remove_recv_stream(id);
+    }
+
+    fn remove_recv_stream(&self, id: StreamId) -> bool {
+        self.lock_streams().remove(&id).is_some()
     }
 
     pub(crate) async fn send_frame(&self, frame: Frame) -> Result<()> {
@@ -1083,11 +1298,14 @@ impl SessionInner {
         }
         // Close existing streams
         {
-            let mut streams = self.streams.lock().await;
+            let mut streams = self.lock_streams();
             streams.clear();
         }
         {
-            let mut send_flows = self.send_flows.lock().await;
+            let mut send_flows = self.lock_send_flows();
+            for flow in send_flows.values() {
+                flow.close();
+            }
             send_flows.clear();
         }
     }
@@ -1111,6 +1329,40 @@ impl SessionInner {
 
     fn peer_is_server(&self) -> bool {
         !self.is_server
+    }
+
+    fn lock_send_flows(&self) -> StdMutexGuard<'_, HashMap<StreamId, Arc<SendFlowState>>> {
+        self.send_flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_streams(&self) -> StdMutexGuard<'_, HashMap<StreamId, RecvState>> {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn validate_peer_stream_id(&self, id: StreamId) -> bool {
+        let next = match id.dir() {
+            StreamDir::Uni => &self.next_peer_uni,
+            StreamDir::Bi => &self.next_peer_bi,
+        };
+        let mut current = next.load(Ordering::SeqCst);
+        loop {
+            if id.counter() < current {
+                return false;
+            }
+            match next.compare_exchange(
+                current,
+                id.counter().saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -1258,7 +1510,10 @@ mod tests {
             accept_bi_tx,
         ));
         let id = StreamId::new(0, false, StreamDir::Bi).expect("stream id");
-        let flow = inner.register_send_flow(id, u64::MAX).await;
+        let flow = inner
+            .register_send_flow(id, u64::MAX)
+            .await
+            .expect("register flow");
         let mut send = SendStream::new(id, inner.clone(), flow);
         let mut recv = inner.register_recv_stream(id).await;
 
@@ -1355,7 +1610,10 @@ mod tests {
             accept_bi_tx,
         ));
         let id = StreamId::new(0, false, StreamDir::Bi).expect("stream id");
-        let flow = inner.register_send_flow(id, u64::MAX).await;
+        let flow = inner
+            .register_send_flow(id, u64::MAX)
+            .await
+            .expect("register flow");
         let mut send = SendStream::new(id, inner, flow);
 
         let first = AsyncWriteExt::write(&mut send, b"x")
@@ -1376,5 +1634,148 @@ mod tests {
             .await
             .expect("second write result");
         assert_eq!(second_ok, 1);
+    }
+
+    #[test]
+    fn limits_reject_zero_and_inconsistent_values() {
+        let limits = Limits {
+            outbound_queue_len: 0,
+            ..Limits::default()
+        };
+        assert!(matches!(limits.validate(), Err(Error::Protocol(_))));
+
+        let mut limits = Limits::default();
+        limits.stream_window_update_threshold = limits.initial_stream_window + 1;
+        assert!(matches!(limits.validate(), Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn receive_flow_control_violation_closes_session() {
+        let limits = Limits::default();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(8);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(8);
+        let inner = Arc::new(SessionInner::new(
+            false,
+            limits.clone(),
+            outbound_tx,
+            accept_uni_tx,
+            accept_bi_tx,
+        ));
+        let id = StreamId::new(0, false, StreamDir::Bi).expect("stream id");
+        let _recv = inner.register_recv_stream(id).await;
+
+        for _ in 0..2 {
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from(vec![0; limits.max_stream_data_per_frame]),
+                    fin: false,
+                })
+                .await
+                .expect("data within advertised credit");
+        }
+
+        let err = inner
+            .handle_frame(Frame::Stream {
+                id,
+                data: Bytes::from_static(b"x"),
+                fin: false,
+            })
+            .await
+            .expect_err("credit violation must fail");
+        assert!(matches!(err, Error::Protocol(_)));
+        assert!(inner.is_closed());
+    }
+
+    #[tokio::test]
+    async fn peer_stream_ids_must_be_monotonic() {
+        let limits = Limits::default();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(8);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(8);
+        let inner = Arc::new(SessionInner::new(
+            false,
+            limits,
+            outbound_tx,
+            accept_uni_tx,
+            accept_bi_tx,
+        ));
+        let first = StreamId::new(1, true, StreamDir::Uni).expect("stream id");
+        inner
+            .handle_frame(Frame::OpenUni { id: first })
+            .await
+            .expect("forward stream id is valid");
+        let stale = StreamId::new(0, true, StreamDir::Uni).expect("stream id");
+        let err = inner
+            .handle_frame(Frame::OpenUni { id: stale })
+            .await
+            .expect_err("stale stream id must fail");
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn final_frame_data_survives_partial_chunk_reads() {
+        let limits = Limits::default();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(8);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(8);
+        let inner = Arc::new(SessionInner::new(
+            false,
+            limits,
+            outbound_tx,
+            accept_uni_tx,
+            accept_bi_tx,
+        ));
+        let id = StreamId::new(0, false, StreamDir::Bi).expect("stream id");
+        let mut recv = inner.register_recv_stream(id).await;
+        inner
+            .handle_frame(Frame::Stream {
+                id,
+                data: Bytes::from_static(b"hello"),
+                fin: true,
+            })
+            .await
+            .expect("final frame");
+
+        assert_eq!(
+            recv.read_chunk(2).await.expect("first chunk").as_deref(),
+            Some(b"he".as_slice())
+        );
+        assert_eq!(
+            recv.read_chunk(2).await.expect("second chunk").as_deref(),
+            Some(b"ll".as_slice())
+        );
+        assert_eq!(
+            recv.read_chunk(2).await.expect("third chunk").as_deref(),
+            Some(b"o".as_slice())
+        );
+        assert!(recv.read_chunk(2).await.expect("end of stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_send_stream_clone_does_not_reset_the_stream() {
+        let limits = Limits::default();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(8);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(8);
+        let inner = Arc::new(SessionInner::new(
+            false,
+            limits,
+            outbound_tx,
+            accept_uni_tx,
+            accept_bi_tx,
+        ));
+        let id = StreamId::new(0, false, StreamDir::Uni).expect("stream id");
+        let flow = inner
+            .register_send_flow(id, 64)
+            .await
+            .expect("register flow");
+        let send = SendStream::new(id, inner.clone(), flow);
+        drop(send.clone());
+
+        assert!(inner.lock_send_flows().contains_key(&id));
+        assert!(outbound_rx.try_recv().is_err());
+        send.write(b"x").await.expect("remaining clone is usable");
     }
 }

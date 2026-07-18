@@ -26,8 +26,10 @@ pub async fn run_mux_bi_demo(url: &str, log: impl Fn(&str)) {
 
     let (send, mut recv) = session.open_bi().expect("open_bi failed");
 
-    send.write(b"hello mux from wasm").expect("send failed");
-    send.finish().expect("finish failed");
+    send.write(b"hello mux from wasm")
+        .await
+        .expect("send failed");
+    send.finish().await.expect("finish failed");
 
     let mut buf = vec![0u8; 1024];
     while let Some(n) = recv.read(&mut buf).await.expect("read failed") {
