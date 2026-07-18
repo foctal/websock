@@ -38,6 +38,27 @@ See [examples][examples-url].
 
 The `websock-wasm-demo` crate includes a small browser app that connects to an echo server.
 
+## Resource limits
+
+WebSocket clients and servers use conservative message, frame, and write-buffer
+limits by default. Customize them with `WebSocketLimits`:
+
+```rust
+use websock::{ClientBuilder, WebSocketLimits};
+
+let client = ClientBuilder::new()
+    .with_limits(WebSocketLimits {
+        max_message_size: 2 * 1024 * 1024,
+        max_frame_size: 512 * 1024,
+        max_write_buffer_size: 2 * 1024 * 1024,
+    })
+    .build();
+```
+
+The mux transports additionally expose `Limits` for stream counts, queue
+capacities, batching, and per-stream flow-control windows. Invalid or
+inconsistent limits return a protocol error rather than panicking.
+
 ## Benchmarking
 
 Criterion benchmarks are available for `websock-mux-proto`.
