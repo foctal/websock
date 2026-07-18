@@ -60,17 +60,12 @@ async fn main() -> anyhow::Result<()> {
         let mut conn = server.accept().await?;
         tracing::info!("accepted connection: {:?}", conn.peer_addr());
         tokio::spawn(async move {
-            loop {
-                match conn.recv().await {
-                    Ok(msg) => {
-                        tracing::info!("received message: {:?}", msg);
-                        if conn.send(msg).await.is_err() {
-                            break;
-                        }
-                        tracing::info!("echoed message");
-                    }
-                    Err(_) => break,
+            while let Ok(msg) = conn.recv().await {
+                tracing::info!("received message: {:?}", msg);
+                if conn.send(msg).await.is_err() {
+                    break;
                 }
+                tracing::info!("echoed message");
             }
             let _ = conn.close().await;
             tracing::info!("connection closed");

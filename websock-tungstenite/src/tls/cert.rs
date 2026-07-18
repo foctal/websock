@@ -22,7 +22,7 @@ pub fn get_native_certs() -> Result<rustls::RootCertStore> {
 pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let cert_bytes = fs::read(cert_path).map_err(|e| Error::Io(e.to_string()))?;
 
-    if cert_path.extension().map_or(false, |x| x == "der") {
+    if cert_path.extension().is_some_and(|x| x == "der") {
         return Ok(vec![CertificateDer::from(cert_bytes)]);
     }
 
