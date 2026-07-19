@@ -64,6 +64,14 @@ inconsistent limits return a protocol error rather than panicking.
 The multiplexing wire format, stream lifecycle, flow control, compatibility
 policy, and error codes are specified in [docs/mux-protocol.md](docs/mux-protocol.md).
 
+## Error handling
+
+Native I/O failures retain their original `std::io::Error`, including the
+`ErrorKind`, in `websock_proto::Error::Io`. TLS and underlying WebSocket
+transport failures retain their concrete errors as standard error sources.
+Call `std::error::Error::source` to inspect or downcast those sources, and use
+`Error::io_kind` when only the I/O classification is needed.
+
 ## Benchmarking
 
 Criterion benchmarks are available for `websock-mux-proto`.

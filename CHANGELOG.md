@@ -19,6 +19,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- The shared error API now retains native `std::io::Error` values and structured
+  TLS and WebSocket transport sources instead of storing their display strings.
+  This changes the public payload of `Error::Io` and `Error::Tls` and adds
+  `Error::Transport`.
 - The mux TLS helpers now reuse the native transport implementation.
 - PEM parsing now uses `rustls-pki-types` directly instead of the unmaintained
   `rustls-pemfile` crate.

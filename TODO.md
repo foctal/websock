@@ -61,7 +61,7 @@ items remain release blockers or follow-up work.
 
 ## P2 — API, observability, and release engineering
 
-- [ ] Preserve structured error sources and I/O error kinds instead of reducing
+- [x] Preserve structured error sources and I/O error kinds instead of reducing
   all transport errors to strings. This is a semver-sensitive public API change.
 - [x] Expose negotiated subprotocol and close-frame details consistently on
   native and browser connections.

@@ -24,3 +24,16 @@ The publishable dependency order is:
 5. `websock` and `websock-mux`
 
 `websock-wasm-demo` is not published.
+
+For the manual package-content inspection in step 7, run:
+
+```text
+cargo package --list -p websock-proto
+cargo package --list -p websock-mux-proto
+cargo package --list -p websock-tungstenite
+cargo package --list -p websock-wasm
+cargo package --list -p websock-tungstenite-mux
+cargo package --list -p websock-wasm-mux
+cargo package --list -p websock
+cargo package --list -p websock-mux
+```
