@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use std::error::Error as _;
 use websock_proto::{Error, Message, WebSocketLimits};
 use websock_tungstenite::{ClientBuilder, ServerBuilder};
 
@@ -62,7 +63,11 @@ async fn server_rejects_message_above_configured_limit() {
             .recv()
             .await
             .expect_err("oversized message must fail");
-        assert!(matches!(err, Error::Protocol(_)));
+        assert!(matches!(err, Error::Transport(_)));
+        assert!(
+            err.source()
+                .is_some_and(|source| source.is::<tokio_tungstenite::tungstenite::Error>())
+        );
     });
 
     let client = ClientBuilder::new().build();

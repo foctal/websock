@@ -110,9 +110,7 @@ impl ClientBuilder {
     {
         let mut roots = RootCertStore::empty();
         for cert in chain {
-            roots
-                .add(CertificateDer::from(cert))
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            roots.add(CertificateDer::from(cert)).map_err(Error::tls)?;
         }
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
@@ -265,7 +263,7 @@ impl ServerBuilder {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(chain, key)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(Error::tls)?;
         self.tls = Some(config);
         Ok(self)
     }

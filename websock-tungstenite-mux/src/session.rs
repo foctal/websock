@@ -1586,10 +1586,10 @@ fn io_invalid_input(message: &'static str) -> io::Error {
 fn io_from_error(err: Error) -> io::Error {
     match err {
         Error::Closed => io_closed(),
-        Error::Io(message) => io::Error::other(message),
+        Error::Io(error) => error,
+        Error::Tls(error) | Error::Transport(error) => io::Error::other(error),
         Error::Protocol(message)
         | Error::InvalidUrl(message)
-        | Error::Tls(message)
         | Error::StreamId(message)
         | Error::Unsupported(message)
         | Error::FrameDecode(message)
@@ -1602,14 +1602,9 @@ pub(crate) fn map_tungstenite_err(e: tungstenite::Error) -> Error {
     use tungstenite::Error as E;
     match e {
         E::ConnectionClosed | E::AlreadyClosed => Error::Closed,
-        E::Io(io) => Error::Io(io.to_string()),
-        E::Tls(tls) => Error::Tls(tls.to_string()),
-        E::Url(url) => Error::InvalidUrl(url.to_string()),
-        E::Protocol(err) => Error::Protocol(err.to_string()),
-        E::Utf8(err) => Error::Protocol(err),
-        E::Capacity(err) => Error::Protocol(err.to_string()),
-        E::HttpFormat(err) => Error::Protocol(err.to_string()),
-        other => Error::Other(other.to_string()),
+        E::Io(io) => Error::Io(io),
+        E::Tls(tls) => Error::tls(tls),
+        other => Error::transport(other),
     }
 }
 
@@ -1904,5 +1899,15 @@ mod tests {
         assert!(inner.lock_send_flows().contains_key(&id));
         assert!(outbound_rx.try_recv().is_err());
         send.write(b"x").await.expect("remaining clone is usable");
+    }
+
+    #[test]
+    fn stream_io_conversion_preserves_io_error_kind() {
+        let error = io_from_error(Error::Io(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "peer reset",
+        )));
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
 }

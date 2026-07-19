@@ -20,7 +20,7 @@ pub fn get_native_certs() -> Result<rustls::RootCertStore> {
 
 /// Load a certificate chain from a file (.der or .pem).
 pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let cert_bytes = fs::read(cert_path).map_err(|e| Error::Io(e.to_string()))?;
+    let cert_bytes = fs::read(cert_path).map_err(Error::Io)?;
 
     if cert_path.extension().is_some_and(|x| x == "der") {
         return Ok(vec![CertificateDer::from(cert_bytes)]);
@@ -28,7 +28,7 @@ pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 
     CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| Error::Io(e.to_string()))
+        .map_err(Error::tls)
 }
 
 /// Certificate verifier that unconditionally accepts certificates.

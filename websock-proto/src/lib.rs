@@ -12,7 +12,7 @@ mod options;
 mod transport;
 
 pub use bytes::Bytes;
-pub use error::{Error, Result};
+pub use error::{BoxError, Error, Result};
 pub use message::{CloseFrame, Message};
 pub use options::{ConnectOptions, ServerOptions, WebSocketLimits, default_ws_alpn};
 pub use transport::{LocalBoxFuture, WebSocketConnection};

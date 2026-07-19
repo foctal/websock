@@ -23,9 +23,7 @@ where
     A: ToSocketAddrs,
 {
     opts.limits.validate()?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| Error::Io(e.to_string()))?;
+    let listener = TcpListener::bind(addr).await.map_err(Error::Io)?;
     let headers = prepare_headers(&opts)?;
     validate_protocols(&opts)?;
 
@@ -68,20 +66,13 @@ impl Server {
     /// Accept an incoming WebSocket connection.
     #[allow(clippy::result_large_err)]
     pub async fn accept(&self) -> Result<Connection<ServerStream>> {
-        let (stream, _addr) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let (stream, _addr) = self.listener.accept().await.map_err(Error::Io)?;
 
-        let peer = stream.peer_addr().map_err(|e| Error::Io(e.to_string()))?;
-        let local = stream.local_addr().map_err(|e| Error::Io(e.to_string()))?;
+        let peer = stream.peer_addr().map_err(Error::Io)?;
+        let local = stream.local_addr().map_err(Error::Io)?;
 
         let (stream, is_tls): (ServerStream, bool) = if let Some(acceptor) = &self.acceptor {
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            let tls_stream = acceptor.accept(stream).await.map_err(Error::tls)?;
             (Box::new(tls_stream), true)
         } else {
             (Box::new(stream), false)
@@ -139,34 +130,22 @@ impl Server {
     pub async fn accept_tls(
         &self,
     ) -> Result<Connection<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
-        let (stream, _addr) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let (stream, _addr) = self.listener.accept().await.map_err(Error::Io)?;
 
         let tls_stream = self
             .acceptor
             .as_ref()
-            .ok_or_else(|| Error::Tls("missing tls acceptor".into()))?
+            .ok_or_else(|| Error::Protocol("missing tls acceptor".into()))?
             .accept(stream)
             .await
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(Error::tls)?;
 
         let headers = Arc::clone(&self.headers);
         let protocols = Arc::clone(&self.protocols);
 
         let mut info = ConnectionInfo {
-            peer: tls_stream
-                .get_ref()
-                .0
-                .peer_addr()
-                .map_err(|e| Error::Io(e.to_string()))?,
-            local: tls_stream
-                .get_ref()
-                .0
-                .local_addr()
-                .map_err(|e| Error::Io(e.to_string()))?,
+            peer: tls_stream.get_ref().0.peer_addr().map_err(Error::Io)?,
+            local: tls_stream.get_ref().0.local_addr().map_err(Error::Io)?,
             is_tls: true,
             subprotocol: None,
         };
@@ -210,9 +189,7 @@ impl Server {
 
     /// Return the local address of the listener.
     pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|e| Error::Io(e.to_string()))
+        self.listener.local_addr().map_err(Error::Io)
     }
 }
 

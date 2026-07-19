@@ -70,9 +70,7 @@ where
     A: ToSocketAddrs,
 {
     limits.validate()?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| Error::Io(e.to_string()))?;
+    let listener = TcpListener::bind(addr).await.map_err(Error::Io)?;
     let headers = prepare_headers(&opts)?;
     validate_protocols(&opts)?;
 
@@ -105,17 +103,10 @@ pub struct Server {
 impl Server {
     #[allow(clippy::result_large_err)]
     pub async fn accept(&self) -> Result<Session> {
-        let (stream, _) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let (stream, _) = self.listener.accept().await.map_err(Error::Io)?;
 
         let (stream, _is_tls): (ServerStream, bool) = if let Some(acceptor) = &self.acceptor {
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            let tls_stream = acceptor.accept(stream).await.map_err(Error::tls)?;
             (Box::new(tls_stream), true)
         } else {
             (Box::new(stream), false)
@@ -164,8 +155,6 @@ impl Server {
     }
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|e| Error::Io(e.to_string()))
+        self.listener.local_addr().map_err(Error::Io)
     }
 }

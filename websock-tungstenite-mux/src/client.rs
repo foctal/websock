@@ -67,9 +67,7 @@ impl Client {
         self.limits.validate()?;
         validate_client_protocols(&self.opts)?;
 
-        let mut request = url
-            .into_client_request()
-            .map_err(|e| websock_proto::Error::InvalidUrl(e.to_string()))?;
+        let mut request = url.into_client_request().map_err(Error::transport)?;
 
         let headers = request.headers_mut();
         for (k, v) in self.opts.headers.iter() {

@@ -39,9 +39,7 @@ pub async fn connect_with_tls(
         .max_write_buffer_size(opts.limits.max_write_buffer_size)
         .max_message_size(Some(opts.limits.max_message_size))
         .max_frame_size(Some(opts.limits.max_frame_size));
-    let mut req = url
-        .into_client_request()
-        .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+    let mut req = url.into_client_request().map_err(Error::transport)?;
 
     // Apply configured headers and subprotocols.
     {
@@ -70,16 +68,8 @@ pub async fn connect_with_tls(
             .map_err(map_tungstenite_err)?;
 
     let info = ConnectionInfo {
-        peer: ws
-            .get_ref()
-            .get_ref()
-            .peer_addr()
-            .map_err(|e| Error::Io(e.to_string()))?,
-        local: ws
-            .get_ref()
-            .get_ref()
-            .local_addr()
-            .map_err(|e| Error::Io(e.to_string()))?,
+        peer: ws.get_ref().get_ref().peer_addr().map_err(Error::Io)?,
+        local: ws.get_ref().get_ref().local_addr().map_err(Error::Io)?,
         is_tls: matches!(ws.get_ref(), tokio_tungstenite::MaybeTlsStream::Rustls(_)),
         subprotocol: resp
             .headers()
@@ -219,13 +209,41 @@ pub(crate) fn map_tungstenite_err(e: tungstenite::Error) -> Error {
     use tungstenite::Error as E;
     match e {
         E::ConnectionClosed | E::AlreadyClosed => Error::Closed,
-        E::Io(io) => Error::Io(io.to_string()),
-        E::Tls(tls) => Error::Tls(tls.to_string()),
-        E::Url(url) => Error::InvalidUrl(url.to_string()),
-        E::Protocol(err) => Error::Protocol(err.to_string()),
-        E::Utf8(err) => Error::Protocol(err),
-        E::Capacity(err) => Error::Protocol(err.to_string()),
-        E::HttpFormat(err) => Error::Protocol(err.to_string()),
-        other => Error::Other(other.to_string()),
+        E::Io(io) => Error::Io(io),
+        E::Tls(tls) => Error::tls(tls),
+        other => Error::transport(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+    use std::io;
+
+    use super::map_tungstenite_err;
+    use websock_proto::Error;
+
+    #[test]
+    fn tungstenite_io_error_preserves_kind() {
+        let error = map_tungstenite_err(tokio_tungstenite::tungstenite::Error::Io(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "connection aborted",
+        )));
+
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::ConnectionAborted));
+    }
+
+    #[test]
+    fn tungstenite_protocol_error_is_retained_as_source() {
+        let error = map_tungstenite_err(tokio_tungstenite::tungstenite::Error::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ));
+
+        assert!(matches!(error, Error::Transport(_)));
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.is::<tokio_tungstenite::tungstenite::Error>())
+        );
     }
 }
