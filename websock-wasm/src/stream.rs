@@ -1,7 +1,7 @@
 //! Sink/Stream split helpers for browser WebSocket connections.
 
 use crate::Connection;
-use crate::connection::js_err;
+use crate::connection::{check_send_capacity, js_err};
 use futures_channel::mpsc;
 use futures_core::Stream;
 use futures_sink::Sink;
@@ -17,15 +17,21 @@ pub struct ConnectionSink {
     ws: Rc<web_sys::WebSocket>,
     closed: bool,
     ref_count: Rc<Cell<usize>>,
+    max_write_buffer_size: usize,
 }
 
 impl ConnectionSink {
     /// Create a sink backed by the provided WebSocket instance.
-    fn new(ws: Rc<web_sys::WebSocket>, ref_count: Rc<Cell<usize>>) -> Self {
+    fn new(
+        ws: Rc<web_sys::WebSocket>,
+        ref_count: Rc<Cell<usize>>,
+        max_write_buffer_size: usize,
+    ) -> Self {
         Self {
             ws,
             closed: false,
             ref_count,
+            max_write_buffer_size,
         }
     }
 }
@@ -50,8 +56,14 @@ impl Sink<Message> for ConnectionSink {
             return Err(Error::Closed);
         }
         match item {
-            Message::Text(s) => this.ws.send_with_str(&s).map_err(js_err)?,
-            Message::Binary(b) => this.ws.send_with_u8_array(b.as_ref()).map_err(js_err)?,
+            Message::Text(s) => {
+                check_send_capacity(&this.ws, s.len(), this.max_write_buffer_size)?;
+                this.ws.send_with_str(&s).map_err(js_err)?;
+            }
+            Message::Binary(b) => {
+                check_send_capacity(&this.ws, b.len(), this.max_write_buffer_size)?;
+                this.ws.send_with_u8_array(b.as_ref()).map_err(js_err)?;
+            }
         }
         Ok(())
     }
@@ -90,7 +102,7 @@ impl Drop for ConnectionSink {
 /// Stream wrapper for receiving messages from a browser WebSocket.
 pub struct ConnectionStream {
     ws: Rc<web_sys::WebSocket>,
-    rx: mpsc::UnboundedReceiver<Result<Message>>,
+    rx: mpsc::Receiver<Result<Message>>,
     terminated: bool,
     ref_count: Rc<Cell<usize>>,
     _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
@@ -102,7 +114,7 @@ impl ConnectionStream {
     /// Create a stream backed by the provided WebSocket and receiver.
     fn new(
         ws: Rc<web_sys::WebSocket>,
-        rx: mpsc::UnboundedReceiver<Result<Message>>,
+        rx: mpsc::Receiver<Result<Message>>,
         ref_count: Rc<Cell<usize>>,
         onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
         onerror: Closure<dyn FnMut(web_sys::Event)>,
@@ -164,10 +176,11 @@ pub fn split(mut conn: Connection) -> (ConnectionSink, ConnectionStream) {
 
     let ws_for_sink = Rc::clone(&conn.ws);
     let ws_for_stream = Rc::clone(&conn.ws);
+    let max_write_buffer_size = conn.max_write_buffer_size;
     let ref_count = Rc::new(Cell::new(2));
 
     (
-        ConnectionSink::new(ws_for_sink, Rc::clone(&ref_count)),
+        ConnectionSink::new(ws_for_sink, Rc::clone(&ref_count), max_write_buffer_size),
         ConnectionStream::new(ws_for_stream, rx, ref_count, onmessage, onerror, onclose),
     )
 }

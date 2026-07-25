@@ -1,0 +1,34 @@
+[package]
+name = "websock-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+websock-mux-proto = { path = "../websock-mux-proto" }
+
+[[bin]]
+name = "varint_decode"
+path = "fuzz_targets/varint_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_sequence"
+path = "fuzz_targets/mux_sequence.rs"
+test = false
+doc = false
+bench = false

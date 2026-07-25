@@ -6,9 +6,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{Connector, WebSocketStream, tungstenite};
 use tungstenite::client::IntoClientRequest;
-use websock_proto::{ConnectOptions, Error, Message, Result};
+use websock_proto::{CloseFrame, ConnectOptions, Error, Message, Result};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     /// Remote peer address for the connection.
     pub peer: std::net::SocketAddr,
@@ -16,6 +16,8 @@ pub struct ConnectionInfo {
     pub local: std::net::SocketAddr,
     /// True when the connection is established over TLS.
     pub is_tls: bool,
+    /// WebSocket subprotocol selected during the opening handshake.
+    pub subprotocol: Option<String>,
 }
 
 /// Establish a WebSocket connection using Tokio Tungstenite.
@@ -29,9 +31,15 @@ pub async fn connect_with_tls(
     opts: ConnectOptions,
     tls: Option<Arc<ClientConfig>>,
 ) -> Result<Connection> {
-    let mut req = url
-        .into_client_request()
-        .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+    opts.limits.validate()?;
+    let write_buffer_size = (128 * 1024).min(opts.limits.max_write_buffer_size.saturating_sub(1));
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size((128 * 1024).min(opts.limits.max_frame_size))
+        .write_buffer_size(write_buffer_size)
+        .max_write_buffer_size(opts.limits.max_write_buffer_size)
+        .max_message_size(Some(opts.limits.max_message_size))
+        .max_frame_size(Some(opts.limits.max_frame_size));
+    let mut req = url.into_client_request().map_err(Error::transport)?;
 
     // Apply configured headers and subprotocols.
     {
@@ -54,31 +62,34 @@ pub async fn connect_with_tls(
     }
 
     let connector = tls.map(Connector::Rustls);
-    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector)
-        .await
-        .map_err(map_tungstenite_err)?;
+    let (ws, resp) =
+        tokio_tungstenite::connect_async_tls_with_config(req, Some(config), false, connector)
+            .await
+            .map_err(map_tungstenite_err)?;
 
     let info = ConnectionInfo {
-        peer: ws
-            .get_ref()
-            .get_ref()
-            .peer_addr()
-            .map_err(|e| Error::Io(e.to_string()))?,
-        local: ws
-            .get_ref()
-            .get_ref()
-            .local_addr()
-            .map_err(|e| Error::Io(e.to_string()))?,
+        peer: ws.get_ref().get_ref().peer_addr().map_err(Error::Io)?,
+        local: ws.get_ref().get_ref().local_addr().map_err(Error::Io)?,
         is_tls: matches!(ws.get_ref(), tokio_tungstenite::MaybeTlsStream::Rustls(_)),
+        subprotocol: resp
+            .headers()
+            .get(tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
     };
 
-    Ok(Connection { ws, info })
+    Ok(Connection {
+        ws,
+        info,
+        close_frame: None,
+    })
 }
 
 /// WebSocket connection wrapper around a Tokio Tungstenite stream.
 pub struct Connection<S = tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     pub(crate) ws: WebSocketStream<S>,
     pub(crate) info: ConnectionInfo,
+    pub(crate) close_frame: Option<CloseFrame>,
 }
 
 impl<S> Connection<S>
@@ -117,7 +128,11 @@ where
                 tungstenite::Message::Pong(_) => continue,
                 tungstenite::Message::Text(s) => return Ok(Message::Text(s.to_string())),
                 tungstenite::Message::Binary(b) => return Ok(Message::Binary(b)),
-                tungstenite::Message::Close(_) => {
+                tungstenite::Message::Close(frame) => {
+                    self.close_frame = frame.map(|frame| CloseFrame {
+                        code: frame.code.into(),
+                        reason: frame.reason.to_string(),
+                    });
                     let _ = self.ws.close(None).await;
                     return Err(Error::Closed);
                 }
@@ -175,7 +190,17 @@ impl<S> Connection<S> {
     }
     /// Return the full connection metadata snapshot.
     pub fn info(&self) -> ConnectionInfo {
-        self.info
+        self.info.clone()
+    }
+
+    /// Return the negotiated WebSocket subprotocol, if any.
+    pub fn negotiated_subprotocol(&self) -> Option<&str> {
+        self.info.subprotocol.as_deref()
+    }
+
+    /// Return the most recently received close-frame metadata, if any.
+    pub fn close_frame(&self) -> Option<CloseFrame> {
+        self.close_frame.clone()
     }
 }
 
@@ -184,13 +209,41 @@ pub(crate) fn map_tungstenite_err(e: tungstenite::Error) -> Error {
     use tungstenite::Error as E;
     match e {
         E::ConnectionClosed | E::AlreadyClosed => Error::Closed,
-        E::Io(io) => Error::Io(io.to_string()),
-        E::Tls(tls) => Error::Tls(tls.to_string()),
-        E::Url(url) => Error::InvalidUrl(url.to_string()),
-        E::Protocol(err) => Error::Protocol(err.to_string()),
-        E::Utf8(err) => Error::Protocol(err),
-        E::Capacity(err) => Error::Protocol(err.to_string()),
-        E::HttpFormat(err) => Error::Protocol(err.to_string()),
-        other => Error::Other(other.to_string()),
+        E::Io(io) => Error::Io(io),
+        E::Tls(tls) => Error::tls(tls),
+        other => Error::transport(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+    use std::io;
+
+    use super::map_tungstenite_err;
+    use websock_proto::Error;
+
+    #[test]
+    fn tungstenite_io_error_preserves_kind() {
+        let error = map_tungstenite_err(tokio_tungstenite::tungstenite::Error::Io(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "connection aborted",
+        )));
+
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::ConnectionAborted));
+    }
+
+    #[test]
+    fn tungstenite_protocol_error_is_retained_as_source() {
+        let error = map_tungstenite_err(tokio_tungstenite::tungstenite::Error::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ));
+
+        assert!(matches!(error, Error::Transport(_)));
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.is::<tokio_tungstenite::tungstenite::Error>())
+        );
     }
 }

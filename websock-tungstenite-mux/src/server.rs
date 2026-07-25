@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::handshake::server;
 use tungstenite::http;
@@ -69,9 +69,8 @@ pub async fn bind<A>(
 where
     A: ToSocketAddrs,
 {
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| Error::Io(e.to_string()))?;
+    limits.validate()?;
+    let listener = TcpListener::bind(addr).await.map_err(Error::Io)?;
     let headers = prepare_headers(&opts)?;
     validate_protocols(&opts)?;
 
@@ -102,18 +101,12 @@ pub struct Server {
 }
 
 impl Server {
+    #[allow(clippy::result_large_err)]
     pub async fn accept(&self) -> Result<Session> {
-        let (stream, _) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let (stream, _) = self.listener.accept().await.map_err(Error::Io)?;
 
         let (stream, _is_tls): (ServerStream, bool) = if let Some(acceptor) = &self.acceptor {
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            let tls_stream = acceptor.accept(stream).await.map_err(Error::tls)?;
             (Box::new(tls_stream), true)
         } else {
             (Box::new(stream), false)
@@ -122,7 +115,7 @@ impl Server {
         let headers = Arc::clone(&self.headers);
         let allowed = Arc::clone(&self.allowed);
 
-        let ws = accept_hdr_async(
+        let ws = accept_hdr_async_with_config(
             stream,
             move |req: &server::Request, mut resp: server::Response| {
                 // Additional headers from configuration
@@ -153,6 +146,7 @@ impl Server {
 
                 Ok(resp)
             },
+            Some(self.limits.websocket_config()),
         )
         .await
         .map_err(map_tungstenite_err)?;
@@ -161,8 +155,6 @@ impl Server {
     }
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|e| Error::Io(e.to_string()))
+        self.listener.local_addr().map_err(Error::Io)
     }
 }

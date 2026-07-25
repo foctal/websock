@@ -74,6 +74,12 @@ fn frame_encoded_len_matches_actual_size() {
 }
 
 #[test]
+fn stream_id_rejects_counter_overflow() {
+    assert!(StreamId::new(u64::MAX, false, StreamDir::Bi).is_err());
+    assert!(StreamId::new(1 << 62, true, StreamDir::Uni).is_err());
+}
+
+#[test]
 fn frame_decode_unknown_tag() {
     let mut buf = BytesMut::new();
     VarInt::from_u32(99).encode(&mut buf); // unknown tag
@@ -121,4 +127,17 @@ fn frame_decode_invalid_utf8_reason() {
         FrameDecodeError::InvalidUtf8 => {}
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn frame_decode_rejects_non_boolean_fin() {
+    let id = StreamId::new(0, false, StreamDir::Bi).unwrap();
+    let mut buf = BytesMut::new();
+    VarInt::from_u32(2).encode(&mut buf);
+    VarInt::from_u64(id.0).unwrap().encode(&mut buf);
+    VarInt::from_u32(2).encode(&mut buf);
+    VarInt::from_u32(0).encode(&mut buf);
+
+    let error = Frame::decode(&mut Cursor::new(buf.freeze())).unwrap_err();
+    assert!(matches!(error, FrameDecodeError::InvalidFin(2)));
 }

@@ -6,7 +6,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use websock_proto::default_ws_alpn;
-use websock_proto::{ConnectOptions, Error, Result, ServerOptions};
+use websock_proto::{ConnectOptions, Error, Result, ServerOptions, WebSocketLimits};
 
 /// Builder for creating a WebSocket client.
 ///
@@ -64,6 +64,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Configure WebSocket message, frame, and write-buffer limits.
+    pub fn with_limits(mut self, limits: WebSocketLimits) -> Self {
+        self.opts.limits = limits;
+        self
+    }
+
     /// Add a single subprotocol.
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.opts.protocols.push(protocol.into());
@@ -104,9 +110,7 @@ impl ClientBuilder {
     {
         let mut roots = RootCertStore::empty();
         for cert in chain {
-            roots
-                .add(CertificateDer::from(cert))
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            roots.add(CertificateDer::from(cert)).map_err(Error::tls)?;
         }
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
@@ -238,6 +242,12 @@ impl ServerBuilder {
         self
     }
 
+    /// Configure accepted WebSocket message, frame, and write-buffer limits.
+    pub fn with_limits(mut self, limits: WebSocketLimits) -> Self {
+        self.opts.limits = limits;
+        self
+    }
+
     /// Add a single subprotocol to the allowed set.
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.opts.protocols.push(protocol.into());
@@ -253,7 +263,7 @@ impl ServerBuilder {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(chain, key)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(Error::tls)?;
         self.tls = Some(config);
         Ok(self)
     }

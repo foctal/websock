@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use rustls::pki_types::CertificateDer;
-use std::{fs, io, path};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+use std::path;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use url::Url;
@@ -104,9 +104,6 @@ fn is_localhost_url(url: &Url) -> bool {
 
 /// Load PEM-encoded certificates from disk into DER bytes.
 fn load_pem_certs(p: &path::Path) -> anyhow::Result<Vec<Vec<u8>>> {
-    let f = fs::File::open(p)?;
-    let mut r = io::BufReader::new(f);
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut r).collect::<Result<_, _>>()?;
+    let certs = CertificateDer::pem_file_iter(p)?.collect::<Result<Vec<_>, _>>()?;
     Ok(certs.into_iter().map(|c| c.to_vec()).collect())
 }

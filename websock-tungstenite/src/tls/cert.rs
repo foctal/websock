@@ -1,7 +1,7 @@
 //! Certificate handling utilities.
 
 use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject};
 use std::{fs, path::Path, sync::Arc};
 use websock_proto::{Error, Result};
 
@@ -20,15 +20,15 @@ pub fn get_native_certs() -> Result<rustls::RootCertStore> {
 
 /// Load a certificate chain from a file (.der or .pem).
 pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let cert_bytes = fs::read(cert_path).map_err(|e| Error::Io(e.to_string()))?;
+    let cert_bytes = fs::read(cert_path).map_err(Error::Io)?;
 
-    if cert_path.extension().map_or(false, |x| x == "der") {
+    if cert_path.extension().is_some_and(|x| x == "der") {
         return Ok(vec![CertificateDer::from(cert_bytes)]);
     }
 
-    rustls_pemfile::certs(&mut &*cert_bytes)
-        .collect::<std::result::Result<Vec<_>, std::io::Error>>()
-        .map_err(|e| Error::Io(e.to_string()))
+    CertificateDer::pem_slice_iter(&cert_bytes)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::tls)
 }
 
 /// Certificate verifier that unconditionally accepts certificates.

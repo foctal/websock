@@ -22,8 +22,7 @@ pub type TlsClientConfig = rustls::client::ClientConfig;
 pub fn generate_self_signed_pair_der(
     subject_alt_names: Vec<String>,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert = rcgen::generate_simple_self_signed(subject_alt_names)
-        .map_err(|e| Error::Tls(e.to_string()))?;
+    let cert = rcgen::generate_simple_self_signed(subject_alt_names).map_err(Error::tls)?;
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let cert_chain = vec![CertificateDer::from(cert.cert)];
@@ -34,8 +33,7 @@ pub fn generate_self_signed_pair_der(
 pub fn generate_self_signed_pair_pem(
     subject_alt_names: Vec<String>,
 ) -> Result<(Vec<String>, String)> {
-    let cert = rcgen::generate_simple_self_signed(subject_alt_names)
-        .map_err(|e| Error::Tls(e.to_string()))?;
+    let cert = rcgen::generate_simple_self_signed(subject_alt_names).map_err(Error::tls)?;
 
     let key = cert.signing_key.serialize_pem();
     let cert_chain = vec![cert.cert.pem()];
@@ -65,11 +63,11 @@ impl TlsConfig {
     /// Create a new TLS configuration with the specified certificate and private key.
     pub fn with_cert(cert_path: &Path, key_path: &Path) -> Result<Self> {
         let client_config = TlsClientConfigBuilder::new_with_native_certs()?
-            .with_alpn_protocols(vec![b"h3".to_vec()])
+            .with_alpn_protocols(websock_proto::default_ws_alpn())
             .build();
 
         let server_config = TlsServerConfigBuilder::new_with_cert(cert_path, key_path)?
-            .with_alpn_protocols(vec![b"h3".to_vec()])
+            .with_alpn_protocols(websock_proto::default_ws_alpn())
             .build();
 
         Ok(Self {
@@ -81,12 +79,12 @@ impl TlsConfig {
     /// Create a new TLS configuration with self-signed certificates (localhost).
     pub fn with_self_signed_certs() -> Result<Self> {
         let client_config = TlsClientConfigBuilder::new_with_native_certs()?
-            .with_alpn_protocols(vec![b"h3".to_vec()])
+            .with_alpn_protocols(websock_proto::default_ws_alpn())
             .build();
 
         let server_config =
             TlsServerConfigBuilder::new_with_self_signed_certs(vec!["localhost".into()])?
-                .with_alpn_protocols(vec![b"h3".to_vec()])
+                .with_alpn_protocols(websock_proto::default_ws_alpn())
                 .build();
 
         Ok(Self {
@@ -98,12 +96,12 @@ impl TlsConfig {
     /// Create a new TLS configuration with system certificates (server side is self-signed localhost).
     pub fn new_native_config() -> Result<Self> {
         let client_config = TlsClientConfigBuilder::new_with_native_certs()?
-            .with_alpn_protocols(vec![b"h3".to_vec()])
+            .with_alpn_protocols(websock_proto::default_ws_alpn())
             .build();
 
         let server_config =
             TlsServerConfigBuilder::new_with_self_signed_certs(vec!["localhost".into()])?
-                .with_alpn_protocols(vec![b"h3".to_vec()])
+                .with_alpn_protocols(websock_proto::default_ws_alpn())
                 .build();
 
         Ok(Self {
@@ -115,12 +113,12 @@ impl TlsConfig {
     /// Create a new TLS configuration with no certificate verification (testing only).
     pub fn new_insecure_config() -> Result<Self> {
         let client_config = TlsClientConfigBuilder::new_insecure()?
-            .with_alpn_protocols(vec![b"h3".to_vec()])
+            .with_alpn_protocols(websock_proto::default_ws_alpn())
             .build();
 
         let server_config =
             TlsServerConfigBuilder::new_with_self_signed_certs(vec!["localhost".into()])?
-                .with_alpn_protocols(vec![b"h3".to_vec()])
+                .with_alpn_protocols(websock_proto::default_ws_alpn())
                 .build();
 
         Ok(Self {
@@ -143,7 +141,7 @@ impl TlsServerConfigBuilder {
         let inner = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(Error::tls)?;
         Ok(Self { inner })
     }
 
@@ -153,7 +151,7 @@ impl TlsServerConfigBuilder {
         let inner = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(Error::tls)?;
         Ok(Self { inner })
     }
 

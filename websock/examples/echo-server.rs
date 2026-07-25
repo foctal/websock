@@ -1,8 +1,8 @@
 //! Echo server example for the websock native transport.
 
 use clap::Parser;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{fs, io, path};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::path;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use websock::{Server, ServerBuilder};
@@ -60,17 +60,12 @@ async fn main() -> anyhow::Result<()> {
         let mut conn = server.accept().await?;
         tracing::info!("accepted connection: {:?}", conn.peer_addr());
         tokio::spawn(async move {
-            loop {
-                match conn.recv().await {
-                    Ok(msg) => {
-                        tracing::info!("received message: {:?}", msg);
-                        if conn.send(msg).await.is_err() {
-                            break;
-                        }
-                        tracing::info!("echoed message");
-                    }
-                    Err(_) => break,
+            while let Ok(msg) = conn.recv().await {
+                tracing::info!("received message: {:?}", msg);
+                if conn.send(msg).await.is_err() {
+                    break;
                 }
+                tracing::info!("echoed message");
             }
             let _ = conn.close().await;
             tracing::info!("connection closed");
@@ -83,16 +78,10 @@ fn load_pem_cert_and_key(
     cert_path: &path::Path,
     key_path: &path::Path,
 ) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let chain_file = fs::File::open(cert_path)?;
-    let mut chain_reader = io::BufReader::new(chain_file);
-    let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut chain_reader).collect::<Result<_, _>>()?;
+    let chain = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
     anyhow::ensure!(!chain.is_empty(), "could not find certificate");
 
-    let key_file = fs::File::open(key_path)?;
-    let mut key_reader = io::BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or_else(|| anyhow::anyhow!("missing private key"))?;
+    let key = PrivateKeyDer::from_pem_file(key_path)?;
 
     Ok((chain, key))
 }

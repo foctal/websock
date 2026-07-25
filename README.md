@@ -8,6 +8,8 @@
 
 A minimal WebSocket library for native and WebAssembly.
 
+The minimum supported Rust version (MSRV) is 1.88.
+
 ## Workspace crates
 
 - `websock`: top-level facade that selects native (`websock-tungstenite`) or browser (`websock-wasm`) transport.
@@ -37,6 +39,38 @@ See [examples][examples-url].
 ### WebAssembly
 
 The `websock-wasm-demo` crate includes a small browser app that connects to an echo server.
+
+## Resource limits
+
+WebSocket clients and servers use conservative message, frame, and write-buffer
+limits by default. Customize them with `WebSocketLimits`:
+
+```rust
+use websock::{ClientBuilder, WebSocketLimits};
+
+let client = ClientBuilder::new()
+    .with_limits(WebSocketLimits {
+        max_message_size: 2 * 1024 * 1024,
+        max_frame_size: 512 * 1024,
+        max_write_buffer_size: 2 * 1024 * 1024,
+    })
+    .build();
+```
+
+The mux transports additionally expose `Limits` for stream counts, queue
+capacities, batching, and per-stream flow-control windows. Invalid or
+inconsistent limits return a protocol error rather than panicking.
+
+The multiplexing wire format, stream lifecycle, flow control, compatibility
+policy, and error codes are specified in [docs/mux-protocol.md](docs/mux-protocol.md).
+
+## Error handling
+
+Native I/O failures retain their original `std::io::Error`, including the
+`ErrorKind`, in `websock_proto::Error::Io`. TLS and underlying WebSocket
+transport failures retain their concrete errors as standard error sources.
+Call `std::error::Error::source` to inspect or downcast those sources, and use
+`Error::io_kind` when only the I/O classification is needed.
 
 ## Benchmarking
 
