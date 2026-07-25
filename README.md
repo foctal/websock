@@ -8,8 +8,6 @@
 
 A minimal WebSocket library for native and WebAssembly.
 
-The minimum supported Rust version (MSRV) is 1.88.
-
 ## Workspace crates
 
 - `websock`: top-level facade that selects native (`websock-tungstenite`) or browser (`websock-wasm`) transport.
@@ -26,7 +24,7 @@ The minimum supported Rust version (MSRV) is 1.88.
 
 ```toml
 [dependencies]
-websock = "0.4"
+websock = "0.5"
 ```
 
 API documentation is available on [docs.rs][doc-url].  
@@ -63,14 +61,6 @@ inconsistent limits return a protocol error rather than panicking.
 
 The multiplexing wire format, stream lifecycle, flow control, compatibility
 policy, and error codes are specified in [docs/mux-protocol.md](docs/mux-protocol.md).
-
-## Error handling
-
-Native I/O failures retain their original `std::io::Error`, including the
-`ErrorKind`, in `websock_proto::Error::Io`. TLS and underlying WebSocket
-transport failures retain their concrete errors as standard error sources.
-Call `std::error::Error::source` to inspect or downcast those sources, and use
-`Error::io_kind` when only the I/O classification is needed.
 
 ## Benchmarking
 
