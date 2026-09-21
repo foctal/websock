@@ -112,7 +112,9 @@ impl ClientBuilder {
         for cert in chain {
             roots.add(CertificateDer::from(cert)).map_err(Error::tls)?;
         }
-        let config = ClientConfig::builder()
+        let config = ClientConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|error| websock_proto::Error::Tls(Box::new(error)))?
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -260,7 +262,9 @@ impl ServerBuilder {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|error| websock_proto::Error::Tls(Box::new(error)))?
             .with_no_client_auth()
             .with_single_cert(chain, key)
             .map_err(Error::tls)?;

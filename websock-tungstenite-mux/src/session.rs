@@ -170,30 +170,38 @@ impl Session {
     }
 
     pub async fn open_uni(&self) -> Result<SendStream> {
-        let id = self.inner.next_stream_id(StreamDir::Uni)?;
-        let flow = self.inner.register_send_flow(id, 0).await?;
-        if let Err(err) = self.inner.send_frame(Frame::OpenUni { id }).await {
-            self.inner.remove_send_flow(id);
-            return Err(err);
-        }
-        Ok(SendStream::new(id, self.inner.clone(), flow))
+        self.inner
+            .complete_or_abort(async {
+                let id = self.inner.next_stream_id(StreamDir::Uni)?;
+                let flow = self.inner.register_send_flow(id, 0).await?;
+                if let Err(err) = self.inner.send_frame(Frame::OpenUni { id }).await {
+                    self.inner.remove_send_flow(id);
+                    return Err(err);
+                }
+                Ok(SendStream::new(id, self.inner.clone(), flow))
+            })
+            .await
     }
 
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
-        let id = self.inner.next_stream_id(StreamDir::Bi)?;
-        let flow = self.inner.register_send_flow(id, 0).await?;
-        let recv = self.inner.register_recv_stream(id).await;
-        if let Err(err) = self.inner.send_frame(Frame::OpenBi { id }).await {
-            self.inner.remove_stream(id).await;
-            self.inner.remove_send_flow(id);
-            return Err(err);
-        }
-        if let Err(err) = self.inner.send_initial_credit(id).await {
-            self.inner.remove_stream(id).await;
-            self.inner.remove_send_flow(id);
-            return Err(err);
-        }
-        Ok((SendStream::new(id, self.inner.clone(), flow), recv))
+        self.inner
+            .complete_or_abort(async {
+                let id = self.inner.next_stream_id(StreamDir::Bi)?;
+                let flow = self.inner.register_send_flow(id, 0).await?;
+                let recv = self.inner.register_recv_stream(id).await;
+                if let Err(err) = self.inner.send_frame(Frame::OpenBi { id }).await {
+                    self.inner.remove_stream(id).await;
+                    self.inner.remove_send_flow(id);
+                    return Err(err);
+                }
+                if let Err(err) = self.inner.send_initial_credit(id).await {
+                    self.inner.remove_stream(id).await;
+                    self.inner.remove_send_flow(id);
+                    return Err(err);
+                }
+                Ok((SendStream::new(id, self.inner.clone(), flow), recv))
+            })
+            .await
     }
 
     pub async fn accept_uni(&self) -> Result<RecvStream> {
@@ -207,11 +215,15 @@ impl Session {
     }
 
     /// Gracefully close the WebSocket and wait for all session tasks to finish.
+    ///
+    /// The close handshake, including queue admission, has a five-second deadline.
+    /// A timeout or cancellation aborts the transport and wakes blocked operations.
     pub async fn shutdown(&self) -> Result<()> {
         self.inner.shutdown().await
     }
 
-    /// Return whether the session has finished shutting down.
+    /// Return whether the session is closed or shutting down and rejects new work.
+    /// Use [`Self::shutdown`] to wait for all session tasks to finish.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
@@ -254,7 +266,7 @@ impl SendFlowState {
     }
 
     fn try_reserve(&self, requested: usize) -> usize {
-        if requested == 0 {
+        if requested == 0 || self.closed.load(Ordering::Acquire) {
             return 0;
         }
 
@@ -313,10 +325,17 @@ impl SendFlowState {
     }
 }
 
+/// A send direction. Choose direct write/finish methods or AsyncWrite on first
+/// use; mixing APIs or overlapping direct operations through clones is rejected.
+/// Cancelling a direct operation aborts the session because partial publication
+/// cannot be rolled back. Dropping an unfinished handle resets it, or aborts
+/// the session if the bounded control queue cannot accept the reset.
 pub struct SendStream {
     id: StreamId,
     session: Arc<SessionInner>,
     finished: Arc<AtomicBool>,
+    operation: Arc<AtomicBool>,
+    api_mode: Arc<AtomicU64>,
     flow: Arc<SendFlowState>,
     outbound_tx: mpsc::Sender<OutboundCmd>,
     outbound: PollSender<OutboundCmd>,
@@ -324,13 +343,49 @@ pub struct SendStream {
     fin_queued: bool,
 }
 
+// Shared across clones: concurrent direct operations are rejected instead of
+// allowing FIN/RESET to overtake a suspended write.
+struct SendOperation(Arc<AtomicBool>);
+impl Drop for SendOperation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl SendStream {
+    fn select_api(&self, mode: u64) -> Result<()> {
+        if mode == 0 {
+            return Ok(());
+        }
+        match self
+            .api_mode
+            .compare_exchange(0, mode, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(()),
+            Err(old) if old == mode => Ok(()),
+            Err(_) => Err(Error::Protocol(
+                "cannot mix direct and AsyncWrite APIs on a send stream".into(),
+            )),
+        }
+    }
+    fn begin_operation(&self, mode: u64) -> Result<SendOperation> {
+        self.select_api(mode)?;
+        if self.operation.swap(true, Ordering::AcqRel) {
+            return Err(Error::Protocol(
+                "concurrent send operations are unsupported".into(),
+            ));
+        }
+        Ok(SendOperation(self.operation.clone()))
+    }
+
     fn new(id: StreamId, session: Arc<SessionInner>, flow: Arc<SendFlowState>) -> Self {
         let outbound_tx = session.outbound_tx.clone();
         Self {
             id,
             session,
             finished: Arc::new(AtomicBool::new(false)),
+            operation: Arc::new(AtomicBool::new(false)),
+            api_mode: Arc::new(AtomicU64::new(0)),
             flow,
             outbound: PollSender::new(outbound_tx.clone()),
             outbound_tx,
@@ -344,52 +399,57 @@ impl SendStream {
     }
 
     pub async fn write_buf(&self, data: Bytes) -> Result<()> {
-        if self.finished.load(Ordering::SeqCst) || self.session.is_closed() {
-            return Err(Error::Closed);
-        }
-
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let wanted = (data.len() - offset)
-                .min(MAX_WRITE_CHUNK)
-                .min(self.session.limits.max_stream_data_per_frame);
-            if wanted == 0 {
-                return Err(Error::Protocol("stream frame payload limit is zero".into()));
-            }
-            let grant = poll_fn(|cx| {
-                self.flow.waker.register(cx.waker());
-                let n = self.flow.try_reserve(wanted);
-                if n == 0 {
-                    if self.finished.load(Ordering::SeqCst)
-                        || self.flow.is_closed()
-                        || self.session.is_closed()
-                    {
-                        Poll::Ready(Err(Error::Closed))
-                    } else {
-                        Poll::Pending
-                    }
-                } else {
-                    Poll::Ready(Ok(n))
+        let _operation = self.begin_operation(1)?;
+        self.session
+            .complete_or_abort(async {
+                if self.finished.load(Ordering::SeqCst) || self.session.is_closed() {
+                    return Err(Error::Closed);
                 }
-            })
-            .await?;
 
-            let chunk = data.slice(offset..offset + grant);
-            if let Err(err) = self
-                .session
-                .send_frame(Frame::Stream {
-                    id: self.id,
-                    data: chunk,
-                    fin: false,
-                })
-                .await
-            {
-                self.flow.release(grant);
-                return Err(err);
-            }
-            offset += grant;
-        }
-        Ok(())
+                let mut offset = 0usize;
+                while offset < data.len() {
+                    let wanted = (data.len() - offset)
+                        .min(MAX_WRITE_CHUNK)
+                        .min(self.session.limits.max_stream_data_per_frame);
+                    if wanted == 0 {
+                        return Err(Error::Protocol("stream frame payload limit is zero".into()));
+                    }
+                    let grant = poll_fn(|cx| {
+                        self.flow.waker.register(cx.waker());
+                        let n = self.flow.try_reserve(wanted);
+                        if n == 0 {
+                            if self.finished.load(Ordering::SeqCst)
+                                || self.flow.is_closed()
+                                || self.session.is_closed()
+                            {
+                                Poll::Ready(Err(Error::Closed))
+                            } else {
+                                Poll::Pending
+                            }
+                        } else {
+                            Poll::Ready(Ok(n))
+                        }
+                    })
+                    .await?;
+
+                    let chunk = data.slice(offset..offset + grant);
+                    if let Err(err) = self
+                        .session
+                        .send_frame(Frame::Stream {
+                            id: self.id,
+                            data: chunk,
+                            fin: false,
+                        })
+                        .await
+                    {
+                        self.flow.release(grant);
+                        return Err(err);
+                    }
+                    offset += grant;
+                }
+                Ok(())
+            })
+            .await
     }
 
     pub async fn write_all(&self, data: &[u8]) -> Result<()> {
@@ -397,36 +457,46 @@ impl SendStream {
     }
 
     pub async fn finish(&self) -> Result<()> {
-        if self.finished.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        if self.flow.is_closed() || self.session.is_closed() {
-            return Err(Error::Closed);
-        }
-        if self
-            .finished
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self.session
-                .send_frame(Frame::Stream {
-                    id: self.id,
-                    data: Bytes::new(),
-                    fin: true,
-                })
-                .await?;
-            self.session.remove_send_flow(self.id);
-        }
-        Ok(())
+        let _operation = self.begin_operation(1)?;
+        self.session
+            .complete_or_abort(async {
+                if self.finished.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if self.flow.is_closed() || self.session.is_closed() {
+                    return Err(Error::Closed);
+                }
+                if self
+                    .finished
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.session
+                        .send_frame(Frame::Stream {
+                            id: self.id,
+                            data: Bytes::new(),
+                            fin: true,
+                        })
+                        .await?;
+                    self.session.remove_send_flow(self.id);
+                }
+                Ok(())
+            })
+            .await
     }
 
     pub async fn reset(&self, code: u64) -> Result<()> {
-        VarInt::from_u64(code)
-            .map_err(|_| Error::Protocol("reset code exceeds mux varint range".into()))?;
-        self.finished.store(true, Ordering::SeqCst);
-        self.session.remove_send_flow(self.id);
+        let _operation = self.begin_operation(0)?;
         self.session
-            .send_frame(Frame::ResetStream { id: self.id, code })
+            .complete_or_abort(async {
+                VarInt::from_u64(code)
+                    .map_err(|_| Error::Protocol("reset code exceeds mux varint range".into()))?;
+                self.finished.store(true, Ordering::SeqCst);
+                self.session.remove_send_flow(self.id);
+                self.session
+                    .send_frame(Frame::ResetStream { id: self.id, code })
+                    .await
+            })
             .await
     }
 
@@ -441,6 +511,8 @@ impl Clone for SendStream {
             id: self.id,
             session: self.session.clone(),
             finished: self.finished.clone(),
+            operation: self.operation.clone(),
+            api_mode: self.api_mode.clone(),
             flow: self.flow.clone(),
             outbound_tx: self.outbound_tx.clone(),
             outbound: PollSender::new(self.outbound_tx.clone()),
@@ -457,6 +529,13 @@ impl AsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if let Err(error) = this.select_api(2) {
+            return Poll::Ready(Err(io::Error::other(error.to_string())));
+        }
+        let _operation = match this.begin_operation(2) {
+            Ok(guard) => guard,
+            Err(error) => return Poll::Ready(Err(io::Error::other(error.to_string()))),
+        };
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -498,7 +577,10 @@ impl AsyncWrite for SendStream {
                     fin: false,
                 };
                 match this.outbound.send_item(OutboundCmd::Frame(frame)) {
-                    Ok(()) => Poll::Ready(Ok(chunk_len)),
+                    Ok(()) => {
+                        this.flush_waiter = None;
+                        Poll::Ready(Ok(chunk_len))
+                    }
                     Err(_) => {
                         this.flow.release(chunk_len);
                         Poll::Ready(Err(io_closed()))
@@ -510,6 +592,9 @@ impl AsyncWrite for SendStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Err(error) = this.select_api(2) {
+            return Poll::Ready(Err(io::Error::other(error.to_string())));
+        }
 
         loop {
             if let Some(waiter) = this.flush_waiter.as_mut() {
@@ -550,6 +635,9 @@ impl AsyncWrite for SendStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Err(error) = this.select_api(2) {
+            return Poll::Ready(Err(io::Error::other(error.to_string())));
+        }
         if !this.finished.load(Ordering::SeqCst)
             && (this.flow.is_closed() || this.session.is_closed())
         {
@@ -586,11 +674,18 @@ impl Drop for SendStream {
             return;
         }
         self.session.remove_send_flow(self.id);
-        if !self.finished.load(Ordering::SeqCst) {
-            let _ = self.session.try_send_frame(Frame::ResetStream {
-                id: self.id,
-                code: 0,
-            });
+        if !self.finished.load(Ordering::SeqCst)
+            && self
+                .session
+                .try_send_frame(Frame::ResetStream {
+                    id: self.id,
+                    code: 0,
+                })
+                .is_err()
+        {
+            // A destructor cannot wait for capacity. Fail closed rather
+            // than silently leaving the peer waiting for a terminal frame.
+            self.session.request_shutdown();
         }
     }
 }
@@ -660,20 +755,18 @@ impl RecvStream {
         if target - self.granted < self.update_threshold {
             return;
         }
-        if self
-            .session
-            .try_send_frame(Frame::MaxStreamData {
-                id: self.id,
-                max: target,
-            })
-            .is_ok()
-        {
-            self.granted = target;
-            self.max_data.store(target, Ordering::Release);
+        if self.finished {
+            return;
         }
+        self.granted = target;
+        self.max_data.store(target, Ordering::Release);
+        self.session.queue_credit(self.id, target);
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
+        if buf.is_empty() {
+            return Ok(Some(0));
+        }
         if self.pending.is_empty() {
             if self.finished {
                 return Ok(None);
@@ -713,7 +806,7 @@ impl RecvStream {
         Ok(Some(amt))
     }
 
-    pub async fn read_chunk_internal(&mut self) -> Result<Option<Bytes>> {
+    async fn read_chunk_internal(&mut self) -> Result<Option<Bytes>> {
         match self.receiver.recv().await {
             Some(event) => {
                 if event.fin {
@@ -772,14 +865,18 @@ impl RecvStream {
     }
 
     pub async fn stop(&self, code: u64) -> Result<()> {
-        VarInt::from_u64(code)
-            .map_err(|_| Error::Protocol("stop code exceeds mux varint range".into()))?;
-        if self.stop_sent.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        self.session.remove_recv_stream(self.id);
         self.session
-            .send_frame(Frame::StopSending { id: self.id, code })
+            .complete_or_abort(async {
+                VarInt::from_u64(code)
+                    .map_err(|_| Error::Protocol("stop code exceeds mux varint range".into()))?;
+                if self.stop_sent.swap(true, Ordering::SeqCst) {
+                    return Ok(());
+                }
+                self.session.remove_recv_stream(self.id);
+                self.session
+                    .send_frame(Frame::StopSending { id: self.id, code })
+                    .await
+            })
             .await
     }
 
@@ -791,11 +888,19 @@ impl RecvStream {
 impl Drop for RecvStream {
     fn drop(&mut self) {
         self.session.remove_recv_stream(self.id);
-        if !self.finished && !self.stop_sent.swap(true, Ordering::SeqCst) {
-            let _ = self.session.try_send_frame(Frame::StopSending {
-                id: self.id,
-                code: 0,
-            });
+        if !self.finished
+            && !self.stop_sent.swap(true, Ordering::SeqCst)
+            && self
+                .session
+                .try_send_frame(Frame::StopSending {
+                    id: self.id,
+                    code: 0,
+                })
+                .is_err()
+        {
+            // A destructor cannot wait for capacity. Fail closed rather
+            // than silently leaving the peer waiting for a terminal frame.
+            self.session.request_shutdown();
         }
     }
 }
@@ -865,6 +970,8 @@ pub(crate) struct SessionInner {
     is_server: bool,
     limits: Limits,
     outbound_tx: mpsc::Sender<OutboundCmd>,
+    pending_credit: StdMutex<HashMap<StreamId, u64>>,
+    credit_notify: Notify,
     accept_uni_tx: Mutex<Option<mpsc::Sender<RecvStream>>>,
     accept_bi_tx: Mutex<Option<mpsc::Sender<(SendStream, RecvStream)>>>,
     streams: StdMutex<HashMap<StreamId, RecvState>>,
@@ -875,6 +982,8 @@ pub(crate) struct SessionInner {
     next_peer_bi: AtomicU64,
     closed: AtomicBool,
     shutdown_started: AtomicBool,
+    peer_closed: AtomicBool,
+    peer_close_notify: Notify,
     session_handles: AtomicUsize,
     active_tasks: AtomicUsize,
     tasks_done: Notify,
@@ -893,6 +1002,8 @@ impl SessionInner {
             is_server,
             limits,
             outbound_tx,
+            pending_credit: StdMutex::new(HashMap::new()),
+            credit_notify: Notify::new(),
             accept_uni_tx: Mutex::new(Some(accept_uni_tx)),
             accept_bi_tx: Mutex::new(Some(accept_bi_tx)),
             streams: StdMutex::new(HashMap::new()),
@@ -903,6 +1014,8 @@ impl SessionInner {
             next_peer_bi: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             shutdown_started: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
+            peer_close_notify: Notify::new(),
             session_handles: AtomicUsize::new(1),
             active_tasks: AtomicUsize::new(2),
             tasks_done: Notify::new(),
@@ -921,55 +1034,70 @@ impl SessionInner {
 
         let inbound = self.clone();
         tokio::spawn(async move {
-            loop {
-                let msg = tokio::select! {
-                    _ = inbound.cancel.cancelled() => break,
-                    msg = ws_stream.next() => msg,
-                };
-                let Some(msg) = msg else {
-                    break;
-                };
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
+            let work = async {
+                loop {
+                    let msg = tokio::select! {
+                        _ = inbound.cancel.cancelled() => break,
+                        msg = ws_stream.next() => msg,
+                    };
+                    let Some(msg) = msg else {
+                        break;
+                    };
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    };
 
-                match msg {
-                    tungstenite::Message::Binary(data) => {
-                        if data.len() > inbound.limits.max_ws_message_size {
-                            let _ = inbound.protocol_error(2, "ws message too large").await;
-                            break;
-                        }
-                        let mut cursor = &data[..];
-                        let mut frame_error = false;
-                        while cursor.has_remaining() {
-                            let frame = match Frame::decode(&mut cursor) {
-                                Ok(f) => f,
-                                Err(_) => {
-                                    let _ = inbound.protocol_error(1, "invalid frame").await;
+                    match msg {
+                        tungstenite::Message::Binary(data) => {
+                            if data.len() > inbound.limits.max_ws_message_size {
+                                let _ = inbound.protocol_error(2, "ws message too large").await;
+                                break;
+                            }
+                            let mut cursor = &data[..];
+                            let mut frame_error = false;
+                            while cursor.has_remaining() {
+                                let frame = match Frame::decode(&mut cursor) {
+                                    Ok(f) => f,
+                                    Err(_) => {
+                                        let _ = inbound.protocol_error(1, "invalid frame").await;
+                                        frame_error = true;
+                                        break;
+                                    }
+                                };
+                                if inbound.handle_frame(frame).await.is_err() {
                                     frame_error = true;
                                     break;
                                 }
-                            };
-                            if inbound.handle_frame(frame).await.is_err() {
-                                frame_error = true;
+                            }
+                            if frame_error {
                                 break;
                             }
                         }
-                        if frame_error {
+                        tungstenite::Message::Ping(p) => {
+                            let _ = inbound
+                                .outbound_tx
+                                .try_send(OutboundCmd::Ws(tungstenite::Message::Pong(p)));
+                        }
+                        tungstenite::Message::Close(_) => {
+                            // Reading CLOSE queues tungstenite's automatic reply.
+                            // Keep the transport alive until the writer flushes it.
+                            inbound.peer_closed.store(true, Ordering::Release);
+                            inbound.shutdown_started.store(true, Ordering::Release);
+                            inbound.peer_close_notify.notify_one();
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                inbound.cancel.cancelled(),
+                            )
+                            .await;
                             break;
                         }
+                        _ => {}
                     }
-                    tungstenite::Message::Ping(p) => {
-                        let _ = inbound
-                            .outbound_tx
-                            .try_send(OutboundCmd::Ws(tungstenite::Message::Pong(p)));
-                    }
-                    tungstenite::Message::Close(_) => break,
-                    _ => {}
                 }
-            }
-
+            };
+            tokio::select! { biased; _ = inbound.cancel.cancelled() => {}, _ = work => {} }
+            drop(ws_stream);
             inbound.task_finished().await;
         });
 
@@ -992,115 +1120,229 @@ impl SessionInner {
                 ws_sink.send(tungstenite::Message::Binary(payload)).await
             }
 
-            let mut batch = BytesMut::new();
-            let mut batch_frames = 0usize;
+            let work = async {
+                let mut batch = BytesMut::new();
+                let mut batch_frames = 0usize;
+                let mut close_sent = false;
 
-            loop {
-                let cmd = tokio::select! {
-                    _ = outbound.cancel.cancelled() => {
+                loop {
+                    let cmd = tokio::select! {
+                        biased;
+                        _ = outbound.peer_close_notify.notified() => {
+                            let _ = ws_sink.close().await;
+                            break;
+                        }
+                        _ = outbound.cancel.cancelled() => {
+                            let _ = flush_batch(&mut ws_sink, &mut batch).await;
+                            let _ = ws_sink.close().await;
+                            break;
+                        }
+                        cmd = async {
+                            // Preserve fairness between queued work and credits
+                            // while giving transport termination priority.
+                            tokio::select! {
+                                cmd = outbound_rx.recv() => cmd,
+                                frame = outbound.next_credit(), if !close_sent => Some(OutboundCmd::Frame(frame)),
+                            }
+                        } => cmd,
+                    };
+                    let Some(cmd) = cmd else {
                         let _ = flush_batch(&mut ws_sink, &mut batch).await;
                         let _ = ws_sink.close().await;
                         break;
-                    }
-                    cmd = outbound_rx.recv() => cmd,
-                };
-                let Some(cmd) = cmd else {
-                    let _ = flush_batch(&mut ws_sink, &mut batch).await;
-                    let _ = ws_sink.close().await;
-                    break;
-                };
-                match cmd {
-                    OutboundCmd::Frame(frame) => {
-                        let encoded = frame.encode().freeze();
-                        let frame_len = encoded.len();
+                    };
+                    match cmd {
+                        OutboundCmd::Frame(_) | OutboundCmd::Ws(_) if close_sent => {
+                            // Work admitted concurrently with shutdown cannot be
+                            // written after the WebSocket closing handshake starts.
+                        }
+                        OutboundCmd::Frame(frame) => {
+                            let encoded = frame.encode().freeze();
+                            let frame_len = encoded.len();
 
-                        let max_bytes = outbound
-                            .limits
-                            .max_batch_bytes
-                            .min(outbound.limits.max_ws_message_size);
-                        if !batch.is_empty() && batch.len() + frame_len > max_bytes {
+                            let max_bytes = outbound
+                                .limits
+                                .max_batch_bytes
+                                .min(outbound.limits.max_ws_message_size);
+                            if !batch.is_empty() && batch.len() + frame_len > max_bytes {
+                                if flush_batch(&mut ws_sink, &mut batch).await.is_err() {
+                                    break;
+                                }
+                                batch_frames = 0;
+                            }
+                            batch.extend_from_slice(&encoded);
+                            batch_frames += 1;
+
+                            if batch_frames >= outbound.limits.max_batch_frames
+                                || batch.len() >= max_bytes
+                                || outbound_rx.is_empty()
+                            {
+                                if flush_batch(&mut ws_sink, &mut batch).await.is_err() {
+                                    break;
+                                }
+                                batch_frames = 0;
+                            }
+                        }
+                        OutboundCmd::Ws(msg) => {
                             if flush_batch(&mut ws_sink, &mut batch).await.is_err() {
                                 break;
                             }
                             batch_frames = 0;
+                            if ws_sink.send(msg).await.is_err() {
+                                break;
+                            }
                         }
-                        batch.extend_from_slice(&encoded);
-                        batch_frames += 1;
-
-                        if batch_frames >= outbound.limits.max_batch_frames
-                            || batch.len() >= max_bytes
-                            || outbound_rx.is_empty()
-                        {
+                        OutboundCmd::Flush { ack } => {
                             if flush_batch(&mut ws_sink, &mut batch).await.is_err() {
+                                let _ = ack.send(Err(Error::Closed));
                                 break;
                             }
                             batch_frames = 0;
+                            let flush_res = ws_sink.flush().await.map_err(map_tungstenite_err);
+                            let _ = ack.send(flush_res);
                         }
-                    }
-                    OutboundCmd::Ws(msg) => {
-                        if flush_batch(&mut ws_sink, &mut batch).await.is_err() {
-                            break;
+                        OutboundCmd::Shutdown { ack } => {
+                            let result =
+                                if let Err(err) = flush_batch(&mut ws_sink, &mut batch).await {
+                                    Err(map_tungstenite_err(err))
+                                } else {
+                                    ws_sink.close().await.map_err(map_tungstenite_err)
+                                };
+                            let failed = result.is_err();
+                            let _ = ack.send(result);
+                            if failed {
+                                break;
+                            }
+                            close_sent = true;
+                            // Continue driving the peer's close reply before
+                            // releasing the underlying transport.
                         }
-                        batch_frames = 0;
-                        if ws_sink.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
-                    OutboundCmd::Flush { ack } => {
-                        if flush_batch(&mut ws_sink, &mut batch).await.is_err() {
-                            let _ = ack.send(Err(Error::Closed));
-                            break;
-                        }
-                        batch_frames = 0;
-                        let flush_res = ws_sink.flush().await.map_err(map_tungstenite_err);
-                        let _ = ack.send(flush_res);
-                    }
-                    OutboundCmd::Shutdown { ack } => {
-                        let result = if let Err(err) = flush_batch(&mut ws_sink, &mut batch).await {
-                            Err(map_tungstenite_err(err))
-                        } else {
-                            ws_sink.close().await.map_err(map_tungstenite_err)
-                        };
-                        let _ = ack.send(result);
-                        break;
                     }
                 }
-            }
+            };
+            tokio::select! { biased; _ = outbound.cancel.cancelled() => {}, _ = work => {} }
+            drop(ws_sink);
+            drop(outbound_rx);
             outbound.task_finished().await;
         });
     }
 
+    fn queue_credit(&self, id: StreamId, maximum: u64) {
+        let streams = self.lock_streams();
+        // A FIN/reset may retire the receive state before the application
+        // finishes consuming buffered events. Such streams need no new credit.
+        if !streams.contains_key(&id) {
+            return;
+        }
+        let mut pending = self
+            .pending_credit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.len() >= self.limits.max_open_streams {
+            // Retired streams must not consume the bounded update slots needed
+            // by a new generation of live streams while the writer is stalled.
+            pending.retain(|stream_id, _| streams.contains_key(stream_id));
+        }
+        if pending.len() >= self.limits.max_open_streams && !pending.contains_key(&id) {
+            self.request_shutdown();
+            return;
+        }
+        pending
+            .entry(id)
+            .and_modify(|old| *old = (*old).max(maximum))
+            .or_insert(maximum);
+        drop(pending);
+        self.credit_notify.notify_one();
+    }
+    async fn next_credit(&self) -> Frame {
+        loop {
+            let notified = self.credit_notify.notified();
+            {
+                let mut pending = self
+                    .pending_credit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(id) = pending.keys().next().copied() {
+                    return Frame::MaxStreamData {
+                        id,
+                        max: pending.remove(&id).expect("pending credit"),
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
     fn request_shutdown(&self) {
         self.shutdown_started.store(true, Ordering::Release);
         self.cancel.cancel();
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
-            self.wait_for_tasks().await;
-            return Ok(());
+    /// Cancelled lifecycle operations abort the session rather than leaving
+    /// a half-published OPEN/FIN/RESET or an unrecoverable credit reservation.
+    async fn complete_or_abort<T>(&self, operation: impl std::future::Future<Output = T>) -> T {
+        struct Guard<'a> {
+            session: &'a SessionInner,
+            complete: bool,
         }
-
-        let first = !self.shutdown_started.swap(true, Ordering::AcqRel);
-        let result = if first {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            match self
-                .outbound_tx
-                .send(OutboundCmd::Shutdown { ack: ack_tx })
-                .await
-            {
-                Ok(()) => ack_rx.await.unwrap_or(Err(Error::Closed)),
-                Err(_) => Ok(()),
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if !self.complete {
+                    self.session.request_shutdown();
+                }
             }
-        } else {
-            Ok(())
-        };
-
-        if first {
-            self.cancel.cancel();
         }
-        self.wait_for_tasks().await;
+        let mut guard = Guard {
+            session: self,
+            complete: false,
+        };
+        let result = operation.await;
+        guard.complete = true;
         result
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.complete_or_abort(async {
+            if self.closed.load(Ordering::Acquire) {
+                self.wait_for_tasks().await;
+                return Ok(());
+            }
+            let first = !self.shutdown_started.swap(true, Ordering::AcqRel);
+            let result = if first {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    match self
+                        .outbound_tx
+                        .send(OutboundCmd::Shutdown { ack: ack_tx })
+                        .await
+                    {
+                        Ok(()) => {
+                            let result = ack_rx.await.unwrap_or_else(|_| {
+                                if self.peer_closed.load(Ordering::Acquire) {
+                                    Ok(())
+                                } else {
+                                    Err(Error::Closed)
+                                }
+                            });
+                            if result.is_ok() {
+                                self.wait_for_tasks().await;
+                            }
+                            result
+                        }
+                        Err(_) => Ok(()),
+                    }
+                })
+                .await
+                .unwrap_or(Err(Error::Closed))
+            } else {
+                Ok(())
+            };
+            if first {
+                self.cancel.cancel();
+            }
+            self.wait_for_tasks().await;
+            result
+        })
+        .await
     }
 
     async fn task_finished(&self) {
@@ -1406,6 +1648,10 @@ impl SessionInner {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.pending_credit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         // Close accept channels
         {
             let mut tx = self.accept_uni_tx.lock().await;
@@ -1430,7 +1676,7 @@ impl SessionInner {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.closed.load(Ordering::SeqCst) || self.shutdown_started.load(Ordering::Acquire)
     }
 
     async fn protocol_error(self: &Arc<Self>, code: u64, reason: impl Into<String>) -> Result<()> {
@@ -1909,5 +2155,355 @@ mod tests {
         )));
 
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    #[tokio::test]
+    async fn retired_stream_credit_does_not_exhaust_update_slots() {
+        let (tx, _rx) = mpsc::channel(4);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let limits = Limits {
+            max_open_streams: 1,
+            ..Limits::default()
+        };
+        let inner = Arc::new(SessionInner::new(false, limits, tx, uni_tx, bi_tx));
+        for index in 0..3 {
+            let id = StreamId::new(index, false, StreamDir::Bi).unwrap();
+            let mut recv = inner.clone().register_recv_stream(id).await;
+            inner.queue_credit(id, 128);
+            assert!(
+                !inner.is_closed(),
+                "retired credit must not close the session"
+            );
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::new(),
+                    fin: true,
+                })
+                .await
+                .unwrap();
+            assert!(recv.read_chunk(1).await.unwrap().is_none());
+        }
+        assert_eq!(inner.pending_credit.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn consumed_credit_survives_a_full_outbound_queue() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let limits = Limits {
+            initial_stream_window: 64,
+            stream_window_update_threshold: 32,
+            ..Limits::default()
+        };
+        let inner = Arc::new(SessionInner::new(false, limits, tx, uni_tx, bi_tx));
+        let id = StreamId::new(0, false, StreamDir::Bi).unwrap();
+        let mut recv = inner.clone().register_recv_stream(id).await;
+        inner
+            .try_send_frame(Frame::MaxStreamData { id, max: 64 })
+            .unwrap();
+        for _ in 0..2 {
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from(vec![1; 32]),
+                    fin: false,
+                })
+                .await
+                .unwrap();
+            assert_eq!(recv.read_chunk(32).await.unwrap().unwrap().len(), 32);
+        }
+        let Frame::MaxStreamData { max, .. } = inner.next_credit().await else {
+            panic!("credit frame");
+        };
+        assert_eq!(
+            max, 128,
+            "updates coalesce and remain deliverable without another read"
+        );
+    }
+
+    use super::*;
+    use std::future::Future;
+    use std::task::Waker;
+
+    #[tokio::test]
+    async fn cancellation_aborts_partial_lifecycle_publication() {
+        for operation in 0..7 {
+            let (tx, _rx) = mpsc::channel(1);
+            let (uni_tx, uni_rx) = mpsc::channel(1);
+            let (bi_tx, bi_rx) = mpsc::channel(1);
+            let inner = Arc::new(SessionInner::new(
+                false,
+                Limits::default(),
+                tx,
+                uni_tx,
+                bi_tx,
+            ));
+            let session = Session {
+                inner: inner.clone(),
+                accept_uni: Arc::new(Mutex::new(uni_rx)),
+                accept_bi: Arc::new(Mutex::new(bi_rx)),
+            };
+            let id = StreamId::new(100, false, StreamDir::Bi).unwrap();
+            let flow = inner.register_send_flow(id, 64).await.unwrap();
+            let send = SendStream::new(id, inner.clone(), flow);
+            let recv = inner.register_recv_stream(id).await;
+            inner
+                .try_send_frame(Frame::MaxStreamData { id, max: 64 })
+                .unwrap();
+            let mut cx = Context::from_waker(Waker::noop());
+            {
+                let future: Pin<Box<dyn Future<Output = Result<()>>>> = match operation {
+                    0 => Box::pin(send.write_buf(Bytes::from_static(b"reserved"))),
+                    1 => Box::pin(send.finish()),
+                    2 => Box::pin(send.reset(42)),
+                    3 => Box::pin(recv.stop(42)),
+                    4 => Box::pin(async { session.open_uni().await.map(|_| ()) }),
+                    5 => Box::pin(async { session.open_bi().await.map(|_| ()) }),
+                    _ => Box::pin(session.shutdown()),
+                };
+                let mut future = future;
+                assert!(
+                    future.as_mut().poll(&mut cx).is_pending(),
+                    "operation {operation}"
+                );
+            }
+            assert!(inner.cancel.is_cancelled(), "operation {operation}");
+            assert!(inner.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_releases_a_transport_whose_peer_never_reads() {
+        use tokio::io::AsyncReadExt;
+        let (io, mut peer) = tokio::io::duplex(1);
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let session = Session::new(ws, false, Limits::default()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(7), session.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unresponsive peer must not complete a graceful handshake"
+        );
+        assert_eq!(session.inner.active_tasks.load(Ordering::Acquire), 0);
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut remaining),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn simultaneous_shutdown_joins_both_sessions() {
+        for _ in 0..100 {
+            let (client_io, server_io) = tokio::io::duplex(64);
+            let client = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                client_io,
+                tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            let server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                server_io,
+                tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            let client = Session::new(client, false, Limits::default()).unwrap();
+            let server = Session::new(server, true, Limits::default()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let (left, right) = tokio::join!(client.shutdown(), server.shutdown());
+                left.unwrap();
+                right.unwrap();
+                assert_eq!(client.inner.active_tasks.load(Ordering::Acquire), 0);
+                assert_eq!(server.inner.active_tasks.load(Ordering::Acquire), 0);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_peer_close_reply() {
+        use tungstenite::protocol::Role;
+        for is_server in [false, true] {
+            let (io, peer_io) = tokio::io::duplex(4096);
+            let role = if is_server {
+                Role::Server
+            } else {
+                Role::Client
+            };
+            let peer_role = if is_server {
+                Role::Client
+            } else {
+                Role::Server
+            };
+            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(io, role, None).await;
+            let mut peer =
+                tokio_tungstenite::WebSocketStream::from_raw_socket(peer_io, peer_role, None).await;
+            let session = Session::new(ws, is_server, Limits::default()).unwrap();
+            let mut shutdown = Box::pin(session.shutdown());
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::select! {
+                    result = &mut shutdown => panic!("closed before peer reply: {result:?}"),
+                    message = peer.next() => {
+                        assert!(matches!(message, Some(Ok(tungstenite::Message::Close(_)))));
+                    }
+                }
+                assert!(
+                    shutdown
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                // Flush the reply queued by reading CLOSE. A server reports
+                // ConnectionClosed once the handshake is complete.
+                assert!(matches!(
+                    peer.flush().await,
+                    Ok(()) | Err(tungstenite::Error::ConnectionClosed)
+                ));
+                shutdown.await.unwrap();
+                assert_eq!(session.inner.active_tasks.load(Ordering::Acquire), 0);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_initiated_close_flushes_a_reply_before_releasing_transport() {
+        use tungstenite::protocol::Role;
+        for is_server in [false, true] {
+            let (io, peer_io) = tokio::io::duplex(4096);
+            let role = if is_server {
+                Role::Server
+            } else {
+                Role::Client
+            };
+            let peer_role = if is_server {
+                Role::Client
+            } else {
+                Role::Server
+            };
+            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(io, role, None).await;
+            let mut peer =
+                tokio_tungstenite::WebSocketStream::from_raw_socket(peer_io, peer_role, None).await;
+            let session = Session::new(ws, is_server, Limits::default()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                peer.close(None).await.unwrap();
+                assert!(matches!(
+                    peer.next().await,
+                    Some(Ok(tungstenite::Message::Close(_)))
+                ));
+                session.shutdown().await.unwrap();
+                assert_eq!(session.inner.active_tasks.load(Ordering::Acquire), 0);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_interrupts_blocked_socket_io_and_releases_it() {
+        use tokio::io::AsyncReadExt;
+        let (io, mut peer) = tokio::io::duplex(1);
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let session = Session::new(ws, false, Limits::default()).unwrap();
+        let (_send, _recv) = session.open_bi().await.unwrap();
+        tokio::task::yield_now().await;
+        {
+            let mut shutdown = Box::pin(session.shutdown());
+            assert!(
+                shutdown
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.inner.wait_for_tasks(),
+        )
+        .await
+        .unwrap();
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut remaining),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase2_flush_tests {
+    use super::*;
+    use std::task::Waker;
+    #[tokio::test]
+    async fn writing_after_cancelled_flush_requires_a_new_barrier() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let inner = Arc::new(SessionInner::new(
+            false,
+            Limits::default(),
+            tx,
+            uni_tx,
+            bi_tx,
+        ));
+        let id = StreamId::new(0, false, StreamDir::Bi).unwrap();
+        let flow = inner.register_send_flow(id, 64).await.unwrap();
+        let mut send = SendStream::new(id, inner, flow);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut send).poll_write(&mut cx, b"a"),
+            Poll::Ready(Ok(1))
+        ));
+        assert!(Pin::new(&mut send).poll_flush(&mut cx).is_pending());
+        assert!(matches!(
+            Pin::new(&mut send).poll_write(&mut cx, b"b"),
+            Poll::Ready(Ok(1))
+        ));
+        let _ = rx.try_recv().unwrap();
+        let OutboundCmd::Flush { ack } = rx.try_recv().unwrap() else {
+            panic!("flush barrier");
+        };
+        assert!(
+            ack.send(Ok(())).is_err(),
+            "old acknowledgement must be discarded"
+        );
+        let _ = rx.try_recv().unwrap();
+        assert!(Pin::new(&mut send).poll_flush(&mut cx).is_pending());
+        let OutboundCmd::Flush { ack } = rx.try_recv().unwrap() else {
+            panic!("new flush barrier");
+        };
+        ack.send(Ok(())).unwrap();
+        assert!(matches!(
+            Pin::new(&mut send).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(send.write_buf(Bytes::from_static(b"mixed")).await.is_err());
+        assert!(!send.session.is_closed());
     }
 }
