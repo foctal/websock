@@ -333,3 +333,29 @@ async fn many_concurrent_streams_remain_bounded_under_backpressure() {
     session.shutdown().await.expect("shutdown client session");
     server_task.await.expect("server task");
 }
+
+#[tokio::test]
+async fn unsupported_mux_protocol_is_rejected_before_session_creation() {
+    let server = ServerBuilder::new().build().await.expect("bind server");
+    let mut request = format!("ws://{}", server.local_addr().unwrap())
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        "websock-mux-unsupported".parse().unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let (client, accepted) =
+            tokio::join!(tokio_tungstenite::connect_async(request), server.accept());
+        assert!(
+            accepted.is_err(),
+            "unsupported protocols must not create mux sessions"
+        );
+        match client {
+            Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 400),
+            _ => panic!("unsupported protocol must fail during the HTTP upgrade"),
+        }
+    })
+    .await
+    .expect("bounded unsupported protocol rejection");
+}
