@@ -24,7 +24,7 @@ A minimal WebSocket library for native and WebAssembly.
 
 ```toml
 [dependencies]
-websock = "0.5"
+websock = "0.6"
 ```
 
 API documentation is available on [docs.rs][doc-url].  
