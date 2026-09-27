@@ -13,7 +13,6 @@ use wasm_bindgen::prelude::*;
 /// Establish a browser WebSocket connection.
 pub async fn connect(url: &str, opts: ConnectOptions) -> Result<Connection> {
     opts.limits.validate()?;
-    let max_message_size = opts.limits.max_message_size;
     let ws = if opts.protocols.is_empty() {
         web_sys::WebSocket::new(url).map_err(js_err)?
     } else {
@@ -24,6 +23,11 @@ pub async fn connect(url: &str, opts: ConnectOptions) -> Result<Connection> {
         web_sys::WebSocket::new_with_str_sequence(url, &arr).map_err(js_err)?
     };
 
+    connect_socket(ws, opts).await
+}
+
+async fn connect_socket(ws: web_sys::WebSocket, opts: ConnectOptions) -> Result<Connection> {
+    let max_message_size = opts.limits.max_message_size;
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
     // Channel used to deliver messages to the consumer.
@@ -59,6 +63,20 @@ pub async fn connect(url: &str, opts: ConnectOptions) -> Result<Connection> {
         });
     ws.set_onclose(Some(wait_onclose.as_ref().unchecked_ref()));
 
+    // Cancelled connection attempts must detach JS callbacks before their Rust
+    // closures are dropped, and must close the otherwise ownerless socket.
+    struct ConnectingGuard(web_sys::WebSocket, bool);
+    impl Drop for ConnectingGuard {
+        fn drop(&mut self) {
+            if self.1 {
+                self.0.set_onopen(None);
+                self.0.set_onerror(None);
+                self.0.set_onclose(None);
+                let _ = self.0.close();
+            }
+        }
+    }
+    let mut connecting_guard = ConnectingGuard(ws.clone(), true);
     // Wait until the connection is opened or fails.
     let open_res = open_rx.await;
 
@@ -77,6 +95,8 @@ pub async fn connect(url: &str, opts: ConnectOptions) -> Result<Connection> {
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Other("onopen waiter dropped".into())),
     }
+
+    connecting_guard.1 = false;
 
     // Set up message/error/close handlers.
     let mut tx_msg = tx.clone();
@@ -289,4 +309,38 @@ pub(crate) fn check_send_capacity(
         return Err(Error::Other("websocket write buffer limit exceeded".into()));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod cancellation_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn cancelled_connect_detaches_callbacks_and_closes_its_socket() {
+        let ws = web_sys::WebSocket::new("ws://127.0.0.1:32123/").unwrap();
+        let mut attempt = Box::pin(connect_socket(ws.clone(), ConnectOptions::default()));
+        // No browser event can run before this synchronous test returns.
+        assert!(
+            attempt
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(ws.onopen().is_some());
+        assert!(ws.onerror().is_some());
+        assert!(ws.onclose().is_some());
+        drop(attempt);
+        assert!(ws.onopen().is_none());
+        assert!(ws.onerror().is_none());
+        assert!(ws.onclose().is_none());
+        assert!(matches!(
+            ws.ready_state(),
+            web_sys::WebSocket::CLOSING | web_sys::WebSocket::CLOSED
+        ));
+    }
 }

@@ -28,7 +28,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["logging", "std"] }
 url = "2"
 
 [[example]]

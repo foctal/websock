@@ -16,9 +16,9 @@ bytes = { workspace = true }
 websock-proto = { workspace = true }
 websock-mux-proto = { workspace = true }
 websock-tungstenite = { workspace = true }
-tokio = { version = "1", features = ["rt", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]} 
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3" }
 futures-core = { version = "0.3" }

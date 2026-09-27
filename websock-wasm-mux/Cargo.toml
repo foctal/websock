@@ -12,6 +12,7 @@ categories = ["network-programming", "web-programming"]
 license = "MIT"
 
 [dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
 websock-proto = { workspace = true }
 websock-mux-proto = { workspace = true }
 websock-wasm = { workspace = true }

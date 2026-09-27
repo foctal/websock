@@ -12,7 +12,7 @@ use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite}
 use futures_util::lock::Mutex;
 use futures_util::stream::Stream;
 use futures_util::task::AtomicWaker;
-use futures_util::{FutureExt, SinkExt, StreamExt, future::poll_fn};
+use futures_util::{FutureExt, StreamExt, future::poll_fn};
 use wasm_bindgen_futures::spawn_local;
 use websock_proto::{Error, Message, Result};
 
@@ -243,7 +243,7 @@ impl SendFlowState {
     }
 
     fn try_reserve(&self, requested: usize) -> usize {
-        if requested == 0 {
+        if requested == 0 || self.closed.load(Ordering::Acquire) {
             return 0;
         }
         let requested_u64 = requested as u64;
@@ -301,26 +301,67 @@ impl SendFlowState {
     }
 }
 
+/// A send direction. Choose direct write/finish methods or AsyncWrite on first
+/// use; mixing APIs or overlapping direct operations through clones is rejected.
+/// Cancelling a direct operation aborts the session because partial publication
+/// cannot be rolled back. Dropping an unfinished handle resets it, or aborts
+/// the session if the bounded control queue cannot accept the reset.
 pub struct SendStream {
     id: StreamId,
     session: Rc<SessionInner>,
     finished: Rc<AtomicBool>,
+    operation: Rc<AtomicBool>,
+    api_mode: Rc<AtomicU64>,
     flow: Rc<SendFlowState>,
     outbound: mpsc::Sender<OutboundCmd>,
-    write_in_flight: Option<usize>,
     close_in_flight: bool,
 }
 
+// Shared across clones: concurrent direct operations are rejected instead of
+// allowing FIN/RESET to overtake a suspended write.
+struct SendOperation(Rc<AtomicBool>);
+impl Drop for SendOperation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl SendStream {
+    fn select_api(&self, mode: u64) -> Result<()> {
+        if mode == 0 {
+            return Ok(());
+        }
+        match self
+            .api_mode
+            .compare_exchange(0, mode, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(()),
+            Err(old) if old == mode => Ok(()),
+            Err(_) => Err(Error::Protocol(
+                "cannot mix direct and AsyncWrite APIs on a send stream".into(),
+            )),
+        }
+    }
+    fn begin_operation(&self, mode: u64) -> Result<SendOperation> {
+        self.select_api(mode)?;
+        if self.operation.swap(true, Ordering::AcqRel) {
+            return Err(Error::Protocol(
+                "concurrent send operations are unsupported".into(),
+            ));
+        }
+        Ok(SendOperation(self.operation.clone()))
+    }
+
     fn new(id: StreamId, session: Rc<SessionInner>, flow: Rc<SendFlowState>) -> Self {
         let outbound = session.outbound_tx.borrow().clone();
         Self {
             id,
             session,
             finished: Rc::new(AtomicBool::new(false)),
+            operation: Rc::new(AtomicBool::new(false)),
+            api_mode: Rc::new(AtomicU64::new(0)),
             flow,
             outbound,
-            write_in_flight: None,
             close_in_flight: false,
         }
     }
@@ -330,54 +371,78 @@ impl SendStream {
     }
 
     pub async fn write_buf(&self, data: Bytes) -> Result<()> {
-        if self.finished.load(Ordering::SeqCst)
-            || self.flow.is_closed()
-            || self.session.closed.load(Ordering::SeqCst)
-        {
-            return Err(Error::Closed);
-        }
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let wanted = (data.len() - offset)
-                .min(MAX_WRITE_CHUNK)
-                .min(self.session.limits.max_stream_data_per_frame);
-            if wanted == 0 {
-                return Err(Error::Protocol("stream frame payload limit is zero".into()));
-            }
-            let grant = poll_fn(|cx| {
-                self.flow.waker.register(cx.waker());
-                let grant = self.flow.try_reserve(wanted);
-                if grant == 0 {
-                    if self.flow.is_closed()
-                        || self.finished.load(Ordering::SeqCst)
-                        || self.session.closed.load(Ordering::SeqCst)
-                    {
-                        Poll::Ready(Err(Error::Closed))
-                    } else {
-                        Poll::Pending
-                    }
-                } else {
-                    Poll::Ready(Ok(grant))
+        let _operation = self.begin_operation(1)?;
+        self.session
+            .complete_or_abort(async {
+                if self.finished.load(Ordering::SeqCst)
+                    || self.flow.is_closed()
+                    || (self.session.closed.load(Ordering::SeqCst)
+                        || self.session.shutdown_started.load(Ordering::Acquire))
+                {
+                    return Err(Error::Closed);
                 }
+                let mut offset = 0usize;
+                // Reuse one sender so its reserved channel slot cannot be
+                // renewed for every chunk while the queue is full.
+                let mut outbound = self.outbound.clone();
+                while offset < data.len() {
+                    let wanted = (data.len() - offset)
+                        .min(MAX_WRITE_CHUNK)
+                        .min(self.session.limits.max_stream_data_per_frame);
+                    if wanted == 0 {
+                        return Err(Error::Protocol("stream frame payload limit is zero".into()));
+                    }
+                    let grant = poll_fn(|cx| {
+                        self.flow.waker.register(cx.waker());
+                        let grant = self.flow.try_reserve(wanted);
+                        if grant == 0 {
+                            if self.flow.is_closed()
+                                || self.finished.load(Ordering::SeqCst)
+                                || (self.session.closed.load(Ordering::SeqCst)
+                                    || self.session.shutdown_started.load(Ordering::Acquire))
+                            {
+                                Poll::Ready(Err(Error::Closed))
+                            } else {
+                                Poll::Pending
+                            }
+                        } else {
+                            Poll::Ready(Ok(grant))
+                        }
+                    })
+                    .await?;
+                    let chunk = data.slice(offset..offset + grant);
+                    let mut frame = Some(Frame::Stream {
+                        id: self.id,
+                        data: chunk,
+                        fin: false,
+                    });
+                    let queued = poll_fn(|cx| {
+                        self.flow.waker.register(cx.waker());
+                        if self.flow.is_closed() {
+                            return Poll::Ready(Err(Error::Closed));
+                        }
+                        match outbound.poll_ready(cx) {
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Closed)),
+                            Poll::Ready(Ok(())) => Poll::Ready(
+                                outbound
+                                    .start_send(OutboundCmd::Frame(
+                                        frame.take().expect("frame queued once"),
+                                    ))
+                                    .map_err(|_| Error::Closed),
+                            ),
+                        }
+                    })
+                    .await;
+                    if queued.is_err() {
+                        self.flow.release(grant);
+                        return Err(Error::Closed);
+                    }
+                    offset += grant;
+                }
+                Ok(())
             })
-            .await?;
-            let chunk = data.slice(offset..offset + grant);
-            let mut outbound = self.outbound.clone();
-            if outbound
-                .send(OutboundCmd::Frame(Frame::Stream {
-                    id: self.id,
-                    data: chunk,
-                    fin: false,
-                }))
-                .await
-                .is_err()
-            {
-                self.flow.release(grant);
-                return Err(Error::Closed);
-            }
-            offset += grant;
-        }
-        Ok(())
+            .await
     }
 
     pub async fn write_all(&self, data: &[u8]) -> Result<()> {
@@ -385,10 +450,14 @@ impl SendStream {
     }
 
     pub async fn finish(&self) -> Result<()> {
+        let _operation = self.begin_operation(1)?;
         if self.finished.load(Ordering::SeqCst) {
             return Ok(());
         }
-        if self.flow.is_closed() || self.session.closed.load(Ordering::SeqCst) {
+        if self.flow.is_closed()
+            || (self.session.closed.load(Ordering::SeqCst)
+                || self.session.shutdown_started.load(Ordering::Acquire))
+        {
             return Err(Error::Closed);
         }
         if self
@@ -407,6 +476,7 @@ impl SendStream {
     }
 
     pub async fn reset(&self, code: u64) -> Result<()> {
+        let _operation = self.begin_operation(0)?;
         VarInt::from_u64(code)
             .map_err(|_| Error::Protocol("reset code exceeds mux varint range".into()))?;
         self.finished.store(true, Ordering::SeqCst);
@@ -418,7 +488,8 @@ impl SendStream {
     pub fn closed(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
             || self.flow.is_closed()
-            || self.session.closed.load(Ordering::SeqCst)
+            || (self.session.closed.load(Ordering::SeqCst)
+                || self.session.shutdown_started.load(Ordering::Acquire))
     }
 }
 
@@ -428,9 +499,10 @@ impl Clone for SendStream {
             id: self.id,
             session: self.session.clone(),
             finished: self.finished.clone(),
+            operation: self.operation.clone(),
+            api_mode: self.api_mode.clone(),
             flow: self.flow.clone(),
             outbound: self.outbound.clone(),
-            write_in_flight: None,
             close_in_flight: false,
         }
     }
@@ -443,17 +515,25 @@ impl FuturesAsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if let Err(error) = this.select_api(2) {
+            return Poll::Ready(Err(io::Error::other(error.to_string())));
+        }
+        let _operation = match this.begin_operation(2) {
+            Ok(guard) => guard,
+            Err(error) => return Poll::Ready(Err(io::Error::other(error.to_string()))),
+        };
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         if this.finished.load(Ordering::SeqCst)
             || this.flow.is_closed()
-            || this.session.closed.load(Ordering::SeqCst)
+            || (this.session.closed.load(Ordering::SeqCst)
+                || this.session.shutdown_started.load(Ordering::Acquire))
         {
             return Poll::Ready(Err(io_closed()));
         }
 
-        if this.write_in_flight.is_none() {
+        {
             this.flow.waker.register(cx.waker());
             let wanted = buf
                 .len()
@@ -464,7 +544,10 @@ impl FuturesAsyncWrite for SendStream {
             }
             let chunk_len = this.flow.try_reserve(wanted);
             if chunk_len == 0 {
-                return if this.flow.is_closed() || this.session.closed.load(Ordering::SeqCst) {
+                return if this.flow.is_closed()
+                    || (this.session.closed.load(Ordering::SeqCst)
+                        || this.session.shutdown_started.load(Ordering::Acquire))
+                {
                     Poll::Ready(Err(io_closed()))
                 } else {
                     Poll::Pending
@@ -492,24 +575,17 @@ impl FuturesAsyncWrite for SendStream {
                 this.flow.release(chunk_len);
                 return Poll::Ready(Err(io_closed()));
             }
-            this.write_in_flight = Some(chunk_len);
-        }
-
-        match this.outbound.poll_ready(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(_)) => {
-                this.write_in_flight = None;
-                Poll::Ready(Err(io_closed()))
-            }
-            Poll::Ready(Ok(())) => {
-                let written = this.write_in_flight.take().unwrap_or(0);
-                Poll::Ready(Ok(written))
-            }
+            // start_send owns these bytes. A later call may provide an
+            // unrelated buffer, so acknowledge this chunk immediately.
+            Poll::Ready(Ok(chunk_len))
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Err(error) = this.select_api(2) {
+            return Poll::Ready(Err(io::Error::other(error.to_string())));
+        }
         match this.outbound.poll_ready(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => Poll::Ready(Err(io_closed())),
@@ -519,8 +595,13 @@ impl FuturesAsyncWrite for SendStream {
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Err(error) = this.select_api(2) {
+            return Poll::Ready(Err(io::Error::other(error.to_string())));
+        }
         if !this.finished.load(Ordering::SeqCst)
-            && (this.flow.is_closed() || this.session.closed.load(Ordering::SeqCst))
+            && (this.flow.is_closed()
+                || (this.session.closed.load(Ordering::SeqCst)
+                    || this.session.shutdown_started.load(Ordering::Acquire)))
         {
             return Poll::Ready(Err(io_closed()));
         }
@@ -559,11 +640,18 @@ impl Drop for SendStream {
             return;
         }
         self.session.remove_send_flow(self.id);
-        if !self.finished.load(Ordering::SeqCst) {
-            let _ = self.session.try_send_frame(Frame::ResetStream {
-                id: self.id,
-                code: 0,
-            });
+        if !self.finished.load(Ordering::SeqCst)
+            && self
+                .session
+                .try_send_frame(Frame::ResetStream {
+                    id: self.id,
+                    code: 0,
+                })
+                .is_err()
+        {
+            // A destructor cannot wait for capacity. Fail closed rather
+            // than silently leaving the peer waiting for a terminal frame.
+            self.session.request_shutdown();
         }
     }
 }
@@ -576,6 +664,7 @@ struct RecvEvent {
 
 struct RecvState {
     sender: mpsc::Sender<RecvEvent>,
+    stopped: bool,
     received: u64,
     max_data: Rc<AtomicU64>,
 }
@@ -633,20 +722,18 @@ impl RecvStream {
         if target - self.granted < self.update_threshold {
             return;
         }
-        if self
-            .session
-            .try_send_frame(Frame::MaxStreamData {
-                id: self.id,
-                max: target,
-            })
-            .is_ok()
-        {
-            self.granted = target;
-            self.max_data.store(target, Ordering::Release);
+        if self.finished || self.stop_sent.load(Ordering::Acquire) {
+            return;
         }
+        self.granted = target;
+        self.max_data.store(target, Ordering::Release);
+        self.session.queue_credit(self.id, target);
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
+        if buf.is_empty() {
+            return Ok(Some(0));
+        }
         if self.pending.is_empty() {
             if self.finished {
                 return Ok(None);
@@ -750,7 +837,9 @@ impl RecvStream {
         if self.stop_sent.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.session.streams.borrow_mut().remove(&self.id);
+        if !self.session.stop_recv_stream(self.id) {
+            return Ok(());
+        }
         self.session
             .send_frame(Frame::StopSending { id: self.id, code })
     }
@@ -762,12 +851,21 @@ impl RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        self.session.streams.borrow_mut().remove(&self.id);
-        if !self.finished && !self.stop_sent.swap(true, Ordering::SeqCst) {
-            let _ = self.session.try_send_frame(Frame::StopSending {
-                id: self.id,
-                code: 0,
-            });
+        let needs_stop = self.session.stop_recv_stream(self.id);
+        if needs_stop
+            && !self.finished
+            && !self.stop_sent.swap(true, Ordering::SeqCst)
+            && self
+                .session
+                .try_send_frame(Frame::StopSending {
+                    id: self.id,
+                    code: 0,
+                })
+                .is_err()
+        {
+            // A destructor cannot wait for capacity. Fail closed rather
+            // than silently leaving the peer waiting for a terminal frame.
+            self.session.request_shutdown();
         }
     }
 }
@@ -834,6 +932,8 @@ enum OutboundCmd {
 struct SessionInner {
     limits: Limits,
     outbound_tx: RefCell<mpsc::Sender<OutboundCmd>>,
+    pending_credit: RefCell<HashMap<StreamId, u64>>,
+    credit_waker: AtomicWaker,
     accept_uni_tx: Mutex<Option<mpsc::Sender<RecvStream>>>,
     accept_bi_tx: Mutex<Option<mpsc::Sender<(SendStream, RecvStream)>>>,
     streams: RefCell<HashMap<StreamId, RecvState>>,
@@ -859,6 +959,8 @@ impl SessionInner {
         Self {
             limits,
             outbound_tx: RefCell::new(outbound_tx),
+            pending_credit: RefCell::new(HashMap::new()),
+            credit_waker: AtomicWaker::new(),
             accept_uni_tx: Mutex::new(Some(accept_uni_tx)),
             accept_bi_tx: Mutex::new(Some(accept_bi_tx)),
             streams: RefCell::new(HashMap::new()),
@@ -875,6 +977,67 @@ impl SessionInner {
         }
     }
 
+    async fn complete_or_abort<T>(&self, operation: impl std::future::Future<Output = T>) -> T {
+        struct Guard<'a> {
+            session: &'a SessionInner,
+            complete: bool,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if !self.complete {
+                    self.session.request_shutdown();
+                }
+            }
+        }
+        let mut guard = Guard {
+            session: self,
+            complete: false,
+        };
+        let result = operation.await;
+        guard.complete = true;
+        result
+    }
+
+    fn queue_credit(&self, id: StreamId, maximum: u64) {
+        let streams = self.streams.borrow();
+        // A FIN/reset may retire the receive state before the application
+        // finishes consuming buffered events. Such streams need no new credit.
+        if streams.get(&id).is_none_or(|state| state.stopped) {
+            return;
+        }
+        let mut pending = self.pending_credit.borrow_mut();
+        if pending.len() >= self.limits.max_open_streams {
+            // Retired streams must not consume the bounded update slots needed
+            // by a new generation of live streams while the writer is stalled.
+            pending.retain(|stream_id, _| streams.contains_key(stream_id));
+        }
+        if pending.len() >= self.limits.max_open_streams && !pending.contains_key(&id) {
+            drop(pending);
+            drop(streams);
+            self.request_shutdown();
+            return;
+        }
+        pending
+            .entry(id)
+            .and_modify(|old| *old = (*old).max(maximum))
+            .or_insert(maximum);
+        drop(pending);
+        self.credit_waker.wake();
+    }
+    async fn next_credit(&self) -> Frame {
+        poll_fn(|cx| {
+            self.credit_waker.register(cx.waker());
+            let mut pending = self.pending_credit.borrow_mut();
+            match pending.keys().next().copied() {
+                Some(id) => Poll::Ready(Frame::MaxStreamData {
+                    id,
+                    max: pending.remove(&id).expect("pending credit"),
+                }),
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
     fn request_shutdown(&self) {
         if !self.shutdown_started.swap(true, Ordering::AcqRel) {
             self.outbound_tx.borrow_mut().close_channel();
@@ -886,7 +1049,11 @@ impl SessionInner {
             return Ok(());
         }
         let (tx, rx) = oneshot::channel();
-        self.close_waiters.borrow_mut().push(tx);
+        {
+            let mut waiters = self.close_waiters.borrow_mut();
+            waiters.retain(|waiter| !waiter.is_canceled());
+            waiters.push(tx);
+        }
         rx.await.map_err(|_| Error::Closed)
     }
 
@@ -897,6 +1064,7 @@ impl SessionInner {
     ) {
         let inner = self.clone();
         spawn_local(async move {
+            let mut pending_frame = None;
             loop {
                 futures_util::select! {
                     msg = conn.recv().fuse() => {
@@ -933,7 +1101,18 @@ impl SessionInner {
                             Err(_) => break,
                         }
                     }
-                    out = outbound_rx.next().fuse() => {
+                    out = async {
+                        if let Some(frame) = pending_frame.take() { Some(OutboundCmd::Frame(frame)) }
+                        else {
+                            let queued = outbound_rx.next().fuse();
+                            let credit = inner.next_credit().fuse();
+                            futures_util::pin_mut!(queued, credit);
+                            futures_util::select! {
+                                command = queued => command,
+                                frame = credit => Some(OutboundCmd::Frame(frame)),
+                            }
+                        }
+                    }.fuse() => {
                         match out {
                             Some(OutboundCmd::Frame(frame)) => {
                                 let mut batch = BytesMut::new();
@@ -955,6 +1134,7 @@ impl SessionInner {
                                         Ok(OutboundCmd::Frame(next_frame)) => {
                                             let next = next_frame.encode().freeze();
                                             if !batch.is_empty() && batch.len() + next.len() > max_bytes {
+                                                pending_frame = Some(next_frame);
                                                 break;
                                             }
                                             batch.extend_from_slice(&next);
@@ -973,7 +1153,14 @@ impl SessionInner {
                 }
             }
 
-            let _ = conn.close().await;
+            {
+                let close = conn.close().fuse();
+                let deadline = gloo_timers::future::TimeoutFuture::new(5_000).fuse();
+                futures_util::pin_mut!(close, deadline);
+                futures_util::select! { _ = close => {}, _ = deadline => {} }
+            }
+            drop(conn);
+            drop(outbound_rx);
             inner.close_all().await;
             inner.finish_task();
         });
@@ -1030,15 +1217,14 @@ impl SessionInner {
                     max: self.limits.initial_stream_window as u64,
                 });
 
-                let tx = self.accept_uni_tx.lock().await.clone();
-                if let Some(mut tx) = tx {
+                let mut accept = self.accept_uni_tx.lock().await;
+                if let Some(tx) = accept.as_mut() {
                     match tx.try_send(recv) {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             if e.is_full() {
-                                self.streams.borrow_mut().remove(&id);
-                                let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                                Ok(())
+                                drop(accept);
+                                self.protocol_error(3, "accept queue full").await
                             } else {
                                 Err(Error::Closed)
                             }
@@ -1088,15 +1274,14 @@ impl SessionInner {
                     Err(err) => return self.protocol_error(3, &err.to_string()).await,
                 };
                 let send = SendStream::new(id, self.clone(), flow);
-                let tx = self.accept_bi_tx.lock().await.clone();
-                if let Some(mut tx) = tx {
+                let mut accept = self.accept_bi_tx.lock().await;
+                if let Some(tx) = accept.as_mut() {
                     match tx.try_send((send, recv)) {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             if e.is_full() {
-                                self.streams.borrow_mut().remove(&id);
-                                let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                                Ok(())
+                                drop(accept);
+                                self.protocol_error(3, "accept queue full").await
                             } else {
                                 Err(Error::Closed)
                             }
@@ -1122,37 +1307,42 @@ impl SessionInner {
                             }
                             Some(received) => {
                                 state.received = received;
-                                let (remove, reset) =
+                                let (remove, overflow) = if state.stopped {
+                                    (fin, false)
+                                } else {
                                     match state.sender.try_send(RecvEvent { data, fin }) {
                                         Ok(()) => (fin, false),
-                                        Err(error) => (true, error.is_full()),
-                                    };
+                                        Err(error) => (fin, error.is_full()),
+                                    }
+                                };
                                 if remove {
                                     map.remove(&id);
                                 };
-                                Ok(reset)
+                                Ok(overflow)
                             }
                         },
                     }
                 };
-                let reset = match result {
-                    Ok(reset) => reset,
+                let overflow = match result {
+                    Ok(overflow) => overflow,
                     Err(reason) => return self.protocol_error(2, reason).await,
                 };
-                if reset {
-                    let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
+                if overflow {
+                    return self.protocol_error(3, "receive queue full").await;
                 }
                 Ok(())
             }
             Frame::ResetStream { id, .. } => {
                 let removed = { self.streams.borrow_mut().remove(&id).is_some() };
-                if !removed {
+                if !removed && !self.is_retired_direction(id, true) {
                     return self.protocol_error(1, "reset on unknown stream").await;
                 }
                 Ok(())
             }
-            Frame::StopSending { id, .. } => {
-                if !self.remove_send_flow(id) {
+            Frame::StopSending { id, code } => {
+                if self.remove_send_flow(id) {
+                    self.send_frame(Frame::ResetStream { id, code })?;
+                } else if !self.is_retired_direction(id, false) {
                     return self.protocol_error(1, "stop on unknown stream").await;
                 }
                 Ok(())
@@ -1186,6 +1376,7 @@ impl SessionInner {
             id,
             RecvState {
                 sender: tx,
+                stopped: false,
                 received: 0,
                 max_data: max_data.clone(),
             },
@@ -1211,6 +1402,32 @@ impl SessionInner {
         }
         send_flows.insert(id, flow.clone());
         Ok(flow)
+    }
+
+    fn stop_recv_stream(&self, id: StreamId) -> bool {
+        let mut streams = self.streams.borrow_mut();
+        let Some(state) = streams.get_mut(&id) else {
+            return false;
+        };
+        state.stopped = true;
+        self.pending_credit.borrow_mut().remove(&id);
+        // Retain only bounded accounting until the peer's FIN or RESET arrives.
+        true
+    }
+
+    fn is_retired_direction(&self, id: StreamId, receiving: bool) -> bool {
+        let local = !id.initiator_is_server(); // The browser is always the client.
+        if id.dir() == StreamDir::Uni && local == receiving {
+            return false;
+        }
+        let next = match (local, id.dir()) {
+            (true, StreamDir::Uni) => &self.next_uni,
+            (true, StreamDir::Bi) => &self.next_bi,
+            (false, StreamDir::Uni) => &self.next_peer_uni,
+            (false, StreamDir::Bi) => &self.next_peer_bi,
+        };
+        // Monotonic IDs below the allocation frontier cannot be opened again.
+        id.counter() < next.load(Ordering::Acquire)
     }
 
     fn remove_send_flow(&self, id: StreamId) -> bool {
@@ -1251,6 +1468,7 @@ impl SessionInner {
             return;
         }
 
+        self.pending_credit.borrow_mut().clear();
         self.streams.borrow_mut().clear();
         {
             let mut send_flows = self.send_flows.borrow_mut();
@@ -1389,4 +1607,372 @@ fn io_closed() -> io::Error {
 
 fn io_invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn accept_queue_overflow_terminates_the_session() {
+        for dir in [StreamDir::Uni, StreamDir::Bi] {
+            let (tx, _outgoing) = mpsc::channel(32);
+            let (uni_tx, _uni_rx) = mpsc::channel(1);
+            let (bi_tx, _bi_rx) = mpsc::channel(1);
+            let inner = Rc::new(SessionInner::new(Limits::default(), tx, uni_tx, bi_tx));
+            let mut rejected = false;
+            for counter in 0..8 {
+                let id = StreamId::new(counter, true, dir).unwrap();
+                let frame = match dir {
+                    StreamDir::Uni => Frame::OpenUni { id },
+                    StreamDir::Bi => Frame::OpenBi { id },
+                };
+                if inner.handle_frame(frame).await.is_err() {
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "accept queues must remain bounded");
+            assert!(inner.closed.load(Ordering::SeqCst));
+        }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn receive_queue_overflow_terminates_the_session() {
+        let (inner, mut outgoing) = lifecycle_session(Limits {
+            recv_event_queue_len: 1,
+            ..Limits::default()
+        });
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let _recv = inner.clone().register_recv_stream(id);
+        let mut rejected = false;
+        for _ in 0..8 {
+            if inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from_static(b"x"),
+                    fin: false,
+                })
+                .await
+                .is_err()
+            {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "queue overflow must terminate instead of sending a reset in the wrong direction"
+        );
+        assert!(inner.closed.load(Ordering::SeqCst));
+        assert!(matches!(
+            outgoing.try_recv().unwrap(),
+            OutboundCmd::Frame(Frame::ConnectionClose { code: 3, .. })
+        ));
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn reading_buffered_data_after_stop_does_not_expand_receive_credit() {
+        let (inner, _outgoing) = lifecycle_session(Limits {
+            initial_stream_window: 8,
+            stream_window_update_threshold: 4,
+            ..Limits::default()
+        });
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let mut recv = inner.clone().register_recv_stream(id);
+        inner
+            .handle_frame(Frame::Stream {
+                id,
+                data: Bytes::from_static(b"1234"),
+                fin: false,
+            })
+            .await
+            .unwrap();
+        recv.stop(0).unwrap();
+        assert_eq!(recv.read_chunk(4).await.unwrap().unwrap().len(), 4);
+        assert_eq!(recv.max_data.load(Ordering::Acquire), 8);
+        assert!(
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from_static(b"56789"),
+                    fin: false
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn stop_wakes_an_async_writer_waiting_for_queue_capacity() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let (inner, mut outgoing) = lifecycle_session(Limits::default());
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let flow = inner.register_send_flow(id, u64::MAX).unwrap();
+        let send = SendStream::new(id, inner.clone(), flow);
+        let mut write = Box::pin(send.write_buf(Bytes::from(vec![1; MAX_WRITE_CHUNK * 32])));
+        assert!(
+            write
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(inner.remove_send_flow(id));
+        assert!(write.await.is_err());
+        // Capacity becoming available cannot publish any further data.
+        while outgoing.try_recv().is_ok() {}
+        assert!(send.write(b"after stop").await.is_err());
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    fn lifecycle_session(limits: Limits) -> (Rc<SessionInner>, mpsc::Receiver<OutboundCmd>) {
+        let (tx, rx) = mpsc::channel(8);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let inner = Rc::new(SessionInner::new(limits, tx, uni_tx, bi_tx));
+        (inner, rx)
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn stopped_receive_drains_in_flight_data_until_fin_without_new_credit() {
+        let (inner, mut outgoing) = lifecycle_session(Limits::default());
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let recv = inner.clone().register_recv_stream(id);
+        inner.queue_credit(id, 128);
+        drop(recv);
+        assert!(
+            matches!(outgoing.try_recv().unwrap(), OutboundCmd::Frame(Frame::StopSending { id: stopped, .. }) if stopped == id)
+        );
+        assert!(inner.pending_credit.borrow().is_empty());
+        for fin in [false, true] {
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from_static(b"in flight"),
+                    fin,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(inner.streams.borrow().is_empty());
+        // The opposite direction and subsequent streams remain usable.
+        let flow = inner.register_send_flow(id, 64).unwrap();
+        assert!(!flow.is_closed());
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let mut recv = inner.clone().register_recv_stream(id);
+        inner
+            .handle_frame(Frame::Stream {
+                id,
+                data: Bytes::from_static(b"live"),
+                fin: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            recv.read_chunk(4).await.unwrap().unwrap(),
+            Bytes::from_static(b"live")
+        );
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn stopped_receive_still_enforces_the_original_credit_limit() {
+        let limits = Limits {
+            initial_stream_window: 4,
+            stream_window_update_threshold: 4,
+            ..Limits::default()
+        };
+        let (inner, _outgoing) = lifecycle_session(limits);
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let recv = inner.clone().register_recv_stream(id);
+        drop(recv);
+        inner.queue_credit(id, 1024);
+        assert!(inner.pending_credit.borrow().is_empty());
+        assert!(
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from_static(b"12345"),
+                    fin: false
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn received_fin_suppresses_drop_stop_and_tolerates_crossed_terminal_frames() {
+        let (inner, mut outgoing) = lifecycle_session(Limits::default());
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let recv = inner.clone().register_recv_stream(id);
+        inner
+            .handle_frame(Frame::Stream {
+                id,
+                data: Bytes::new(),
+                fin: true,
+            })
+            .await
+            .unwrap();
+        drop(recv);
+        assert!(outgoing.try_recv().is_err());
+        let flow = inner.register_send_flow(id, 64).unwrap();
+        assert!(inner.remove_send_flow(id));
+        assert!(flow.is_closed());
+        inner
+            .handle_frame(Frame::StopSending { id, code: 7 })
+            .await
+            .unwrap();
+        inner
+            .handle_frame(Frame::ResetStream { id, code: 7 })
+            .await
+            .unwrap();
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn stop_sending_acknowledges_with_reset_and_releases_send_flow() {
+        let (inner, mut outgoing) = lifecycle_session(Limits::default());
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let flow = inner.register_send_flow(id, 64).unwrap();
+        inner
+            .handle_frame(Frame::StopSending { id, code: 7 })
+            .await
+            .unwrap();
+        assert!(flow.is_closed());
+        assert!(
+            matches!(outgoing.try_recv().unwrap(), OutboundCmd::Frame(Frame::ResetStream { id: reset, code: 7 }) if reset == id)
+        );
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn terminal_frames_for_future_or_wrong_direction_streams_are_errors() {
+        for reset in [false, true] {
+            for wrong_direction in [false, true] {
+                let (inner, _outgoing) = lifecycle_session(Limits::default());
+                let id = if wrong_direction {
+                    if reset {
+                        inner.next_stream_id(StreamDir::Uni).unwrap()
+                    } else {
+                        let id = StreamId::new(0, true, StreamDir::Uni).unwrap();
+                        assert!(inner.validate_peer_stream_id(id));
+                        id
+                    }
+                } else {
+                    StreamId::new(100, false, StreamDir::Bi).unwrap()
+                };
+                let frame = if reset {
+                    Frame::ResetStream { id, code: 0 }
+                } else {
+                    Frame::StopSending { id, code: 0 }
+                };
+                assert!(inner.handle_frame(frame).await.is_err());
+            }
+        }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn retired_stream_credit_does_not_exhaust_update_slots() {
+        let (tx, _rx) = mpsc::channel(4);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let limits = Limits {
+            max_open_streams: 1,
+            ..Limits::default()
+        };
+        let inner = Rc::new(SessionInner::new(limits, tx, uni_tx, bi_tx));
+        for index in 0..3 {
+            let id = StreamId::new(index, false, StreamDir::Bi).unwrap();
+            let mut recv = inner.clone().register_recv_stream(id);
+            inner.queue_credit(id, 128);
+            assert!(
+                !inner.shutdown_started.load(Ordering::Acquire)
+                    && !inner.closed.load(Ordering::Acquire),
+                "retired credit must not close the session"
+            );
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::new(),
+                    fin: true,
+                })
+                .await
+                .unwrap();
+            assert!(recv.read_chunk(1).await.unwrap().is_none());
+        }
+        assert_eq!(inner.pending_credit.borrow().len(), 1);
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn consumed_credit_survives_a_full_outbound_queue() {
+        let (tx, _rx) = mpsc::channel(0);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let limits = Limits {
+            initial_stream_window: 64,
+            stream_window_update_threshold: 32,
+            ..Limits::default()
+        };
+        let inner = Rc::new(SessionInner::new(limits, tx, uni_tx, bi_tx));
+        let id = StreamId::new(0, false, StreamDir::Bi).unwrap();
+        let mut recv = inner.clone().register_recv_stream(id);
+        inner
+            .send_frame(Frame::MaxStreamData { id, max: 64 })
+            .unwrap();
+        for _ in 0..2 {
+            inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from(vec![1; 32]),
+                    fin: false,
+                })
+                .await
+                .unwrap();
+            assert_eq!(recv.read_chunk(32).await.unwrap().unwrap().len(), 32);
+        }
+        let Frame::MaxStreamData { max, .. } = inner.next_credit().await else {
+            panic!("credit frame");
+        };
+        assert_eq!(
+            max, 128,
+            "updates coalesce and remain deliverable without another read"
+        );
+    }
+
+    use super::*;
+    use std::task::Waker;
+    use wasm_bindgen_test::*;
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn async_write_acks_owned_bytes_before_waiting_for_next_capacity() {
+        let (tx, mut rx) = mpsc::channel(0);
+        let (uni_tx, _uni_rx) = mpsc::channel(1);
+        let (bi_tx, _bi_rx) = mpsc::channel(1);
+        let inner = Rc::new(SessionInner::new(Limits::default(), tx, uni_tx, bi_tx));
+        let id = StreamId::new(0, false, StreamDir::Bi).unwrap();
+        let flow = inner.register_send_flow(id, 64).unwrap();
+        let mut send = SendStream::new(id, inner, flow);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut send).poll_write(&mut cx, b"previous-buffer"),
+            Poll::Ready(Ok(15))
+        ));
+        assert!(
+            Pin::new(&mut send)
+                .poll_write(&mut cx, b"cancelled")
+                .is_pending()
+        );
+        let frame = rx.try_recv().unwrap();
+        let OutboundCmd::Frame(Frame::Stream { data, .. }) = frame else {
+            panic!("data frame");
+        };
+        assert_eq!(data.as_ref(), b"previous-buffer");
+        assert!(matches!(
+            Pin::new(&mut send).poll_write(&mut cx, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+        let OutboundCmd::Frame(Frame::Stream { data, .. }) = rx.try_recv().unwrap() else {
+            panic!("data frame");
+        };
+        assert_eq!(data.as_ref(), b"x");
+    }
 }
