@@ -359,3 +359,28 @@ async fn unsupported_mux_protocol_is_rejected_before_session_creation() {
     .await
     .expect("bounded unsupported protocol rejection");
 }
+
+#[tokio::test]
+async fn text_mux_message_closes_the_session() {
+    let server = ServerBuilder::new().build().await.unwrap();
+    let mut request = format!("ws://{}", server.local_addr().unwrap())
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(SEC_WEBSOCKET_PROTOCOL, "websock-mux-1".parse().unwrap());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let (client, accepted) =
+            tokio::join!(tokio_tungstenite::connect_async(request), server.accept());
+        let (mut socket, _) = client.unwrap();
+        let session = accepted.unwrap();
+        socket
+            .send(tungstenite::Message::Text("invalid mux message".into()))
+            .await
+            .unwrap();
+        assert!(session.accept_uni().await.is_err());
+        assert!(session.is_closed());
+    })
+    .await
+    .expect("bounded text message rejection");
+}

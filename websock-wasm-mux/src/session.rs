@@ -1002,7 +1002,7 @@ impl SessionInner {
         let streams = self.streams.borrow();
         // A FIN/reset may retire the receive state before the application
         // finishes consuming buffered events. Such streams need no new credit.
-        if !streams.get(&id).is_some_and(|state| !state.stopped) {
+        if streams.get(&id).is_none_or(|state| state.stopped) {
             return;
         }
         let mut pending = self.pending_credit.borrow_mut();
@@ -1217,15 +1217,14 @@ impl SessionInner {
                     max: self.limits.initial_stream_window as u64,
                 });
 
-                let tx = self.accept_uni_tx.lock().await.clone();
-                if let Some(mut tx) = tx {
+                let mut accept = self.accept_uni_tx.lock().await;
+                if let Some(tx) = accept.as_mut() {
                     match tx.try_send(recv) {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             if e.is_full() {
-                                self.streams.borrow_mut().remove(&id);
-                                let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                                Ok(())
+                                drop(accept);
+                                self.protocol_error(3, "accept queue full").await
                             } else {
                                 Err(Error::Closed)
                             }
@@ -1275,15 +1274,14 @@ impl SessionInner {
                     Err(err) => return self.protocol_error(3, &err.to_string()).await,
                 };
                 let send = SendStream::new(id, self.clone(), flow);
-                let tx = self.accept_bi_tx.lock().await.clone();
-                if let Some(mut tx) = tx {
+                let mut accept = self.accept_bi_tx.lock().await;
+                if let Some(tx) = accept.as_mut() {
                     match tx.try_send((send, recv)) {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             if e.is_full() {
-                                self.streams.borrow_mut().remove(&id);
-                                let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                                Ok(())
+                                drop(accept);
+                                self.protocol_error(3, "accept queue full").await
                             } else {
                                 Err(Error::Closed)
                             }
@@ -1309,28 +1307,28 @@ impl SessionInner {
                             }
                             Some(received) => {
                                 state.received = received;
-                                let (remove, reset) = if state.stopped {
+                                let (remove, overflow) = if state.stopped {
                                     (fin, false)
                                 } else {
                                     match state.sender.try_send(RecvEvent { data, fin }) {
                                         Ok(()) => (fin, false),
-                                        Err(error) => (fin || error.is_full(), error.is_full()),
+                                        Err(error) => (fin, error.is_full()),
                                     }
                                 };
                                 if remove {
                                     map.remove(&id);
                                 };
-                                Ok(reset)
+                                Ok(overflow)
                             }
                         },
                     }
                 };
-                let reset = match result {
-                    Ok(reset) => reset,
+                let overflow = match result {
+                    Ok(overflow) => overflow,
                     Err(reason) => return self.protocol_error(2, reason).await,
                 };
-                if reset {
-                    let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
+                if overflow {
+                    return self.protocol_error(3, "receive queue full").await;
                 }
                 Ok(())
             }
@@ -1613,6 +1611,64 @@ fn io_invalid_input(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod phase2_tests {
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn accept_queue_overflow_terminates_the_session() {
+        for dir in [StreamDir::Uni, StreamDir::Bi] {
+            let (tx, _outgoing) = mpsc::channel(32);
+            let (uni_tx, _uni_rx) = mpsc::channel(1);
+            let (bi_tx, _bi_rx) = mpsc::channel(1);
+            let inner = Rc::new(SessionInner::new(Limits::default(), tx, uni_tx, bi_tx));
+            let mut rejected = false;
+            for counter in 0..8 {
+                let id = StreamId::new(counter, true, dir).unwrap();
+                let frame = match dir {
+                    StreamDir::Uni => Frame::OpenUni { id },
+                    StreamDir::Bi => Frame::OpenBi { id },
+                };
+                if inner.handle_frame(frame).await.is_err() {
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "accept queues must remain bounded");
+            assert!(inner.closed.load(Ordering::SeqCst));
+        }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn receive_queue_overflow_terminates_the_session() {
+        let (inner, mut outgoing) = lifecycle_session(Limits {
+            recv_event_queue_len: 1,
+            ..Limits::default()
+        });
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let _recv = inner.clone().register_recv_stream(id);
+        let mut rejected = false;
+        for _ in 0..8 {
+            if inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from_static(b"x"),
+                    fin: false,
+                })
+                .await
+                .is_err()
+            {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "queue overflow must terminate instead of sending a reset in the wrong direction"
+        );
+        assert!(inner.closed.load(Ordering::SeqCst));
+        assert!(matches!(
+            outgoing.try_recv().unwrap(),
+            OutboundCmd::Frame(Frame::ConnectionClose { code: 3, .. })
+        ));
+    }
+
     #[wasm_bindgen_test::wasm_bindgen_test(async)]
     async fn reading_buffered_data_after_stop_does_not_expand_receive_credit() {
         let (inner, _outgoing) = lifecycle_session(Limits {

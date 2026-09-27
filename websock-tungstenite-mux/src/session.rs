@@ -1097,6 +1097,12 @@ impl SessionInner {
                                 .outbound_tx
                                 .try_send(OutboundCmd::Ws(tungstenite::Message::Pong(p)));
                         }
+                        tungstenite::Message::Text(_) => {
+                            let _ = inbound
+                                .protocol_error(1, "text message not supported")
+                                .await;
+                            break;
+                        }
                         tungstenite::Message::Close(_) => {
                             // Reading CLOSE queues tungstenite's automatic reply.
                             // Keep the transport alive until the writer flushes it.
@@ -1249,7 +1255,7 @@ impl SessionInner {
         let streams = self.lock_streams();
         // A FIN/reset may retire the receive state before the application
         // finishes consuming buffered events. Such streams need no new credit.
-        if !streams.get(&id).is_some_and(|state| !state.stopped) {
+        if streams.get(&id).is_none_or(|state| state.stopped) {
             return;
         }
         let mut pending = self
@@ -1408,12 +1414,7 @@ impl SessionInner {
                     match tx.try_send(recv) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Application is not accepting inbound streams fast enough.
-                            // Reset this stream and keep the connection alive.
-                            let mut streams = self.lock_streams();
-                            streams.remove(&id);
-                            let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                            return Ok(());
+                            return self.protocol_error(3, "accept queue full").await;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return Err(Error::Closed),
                     }
@@ -1449,10 +1450,7 @@ impl SessionInner {
                     match tx.try_send((send, recv)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            let mut streams = self.lock_streams();
-                            streams.remove(&id);
-                            let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                            return Ok(());
+                            return self.protocol_error(3, "accept queue full").await;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return Err(Error::Closed),
                     }
@@ -1493,9 +1491,7 @@ impl SessionInner {
                 match tx.try_send(RecvEvent { data, fin }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        self.remove_recv_stream(id);
-                        let _ = self.try_send_frame(Frame::ResetStream { id, code: 3 });
-                        return Ok(());
+                        return self.protocol_error(3, "receive queue full").await;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         if fin {
@@ -1926,6 +1922,70 @@ pub(crate) fn map_tungstenite_err(e: tungstenite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn accept_queue_overflow_terminates_the_session() {
+        for dir in [StreamDir::Uni, StreamDir::Bi] {
+            let (tx, _outgoing) = mpsc::channel(32);
+            let (uni_tx, _uni_rx) = mpsc::channel(1);
+            let (bi_tx, _bi_rx) = mpsc::channel(1);
+            let inner = Arc::new(SessionInner::new(
+                false,
+                Limits::default(),
+                tx,
+                uni_tx,
+                bi_tx,
+            ));
+            let mut rejected = false;
+            for counter in 0..8 {
+                let id = StreamId::new(counter, true, dir).unwrap();
+                let frame = match dir {
+                    StreamDir::Uni => Frame::OpenUni { id },
+                    StreamDir::Bi => Frame::OpenBi { id },
+                };
+                if inner.handle_frame(frame).await.is_err() {
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "accept queues must remain bounded");
+            assert!(inner.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_queue_overflow_terminates_the_session() {
+        let (inner, mut outgoing) = lifecycle_session(Limits {
+            recv_event_queue_len: 1,
+            ..Limits::default()
+        });
+        let id = inner.next_stream_id(StreamDir::Bi).unwrap();
+        let _recv = inner.register_recv_stream(id).await;
+        let mut rejected = false;
+        for _ in 0..8 {
+            if inner
+                .handle_frame(Frame::Stream {
+                    id,
+                    data: Bytes::from_static(b"x"),
+                    fin: false,
+                })
+                .await
+                .is_err()
+            {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "queue overflow must terminate instead of sending a reset in the wrong direction"
+        );
+        assert!(inner.is_closed());
+        assert!(matches!(
+            outgoing.try_recv().unwrap(),
+            OutboundCmd::Frame(Frame::ConnectionClose { code: 3, .. })
+        ));
+    }
+
     #[tokio::test]
     async fn reading_buffered_data_after_stop_does_not_expand_receive_credit() {
         let (inner, _outgoing) = lifecycle_session(Limits {
