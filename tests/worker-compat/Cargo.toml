@@ -1,0 +1,13 @@
+[package]
+name = "websock-worker-compat"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[dependencies]
+worker = { version = "=0.8.7", features = ["http"] }
+websock = { path = "../../websock" }
+websock-mux = { path = "../../websock-mux" }
+
+[workspace]

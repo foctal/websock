@@ -27,8 +27,9 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo fmt --manifest-path tests/worker-compat/Cargo.toml -- --check
+      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo test --workspace --locked
 
   wasm:
     runs-on: ubuntu-latest
@@ -40,10 +41,28 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Check browser crates
         run: >-
-          cargo check
+          cargo check --locked
           -p websock
           -p websock-mux
           -p websock-wasm
           -p websock-wasm-mux
           -p websock-wasm-demo
           --target wasm32-unknown-unknown
+
+      - name: Check workers-rs dependency compatibility
+        run: cargo check --manifest-path tests/worker-compat/Cargo.toml --locked --target wasm32-unknown-unknown
+      - name: Install the locked WASM tools
+        run: cargo install wasm-bindgen-cli --version "$(python3 scripts/test-browser.py --print-bindgen-version)" --locked
+      - name: Run browser unit and integration tests
+        run: python3 scripts/test-browser.py
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal --target wasm32-unknown-unknown
+      - name: Check supported Rust version
+        run: |
+          cargo +1.88.0 check --workspace --locked
+          cargo +1.88.0 check --locked --target wasm32-unknown-unknown -p websock -p websock-mux -p websock-wasm -p websock-wasm-mux -p websock-wasm-demo
