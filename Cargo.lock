@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "websock"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "websock-browser-test-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures-util",
  "tokio",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "websock-mux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "websock-mux-proto"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "websock-proto"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "websock-tungstenite"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "websock-tungstenite-mux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "websock-wasm"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "websock-wasm-demo"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "console_error_panic_hook",
  "futures-util",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "websock-wasm-mux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures-channel",

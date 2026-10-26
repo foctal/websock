@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "websock"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "websock-proto",
  "websock-tungstenite",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "websock-mux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "websock-mux-proto",
  "websock-proto",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "websock-mux-proto"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "thiserror",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "websock-proto"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "websock-tungstenite"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "websock-tungstenite-mux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "websock-wasm"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "websock-wasm-mux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "futures-channel",
